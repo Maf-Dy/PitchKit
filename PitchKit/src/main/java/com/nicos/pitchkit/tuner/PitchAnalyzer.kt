@@ -5,13 +5,7 @@ import com.nicos.pitchkit.tuner.models.InstrumentProfile
 import kotlin.math.PI
 import kotlin.math.sqrt
 
-/**
- * Source-agnostic pitch/chord analyzer.
- *
- * This class has no dependency on AudioRecord or microphone permissions. Feed it
- * normalized PCM from a microphone, decoded file, USB interface, Media3 pipeline,
- * playback capture, or any other source that can provide PCM samples.
- */
+/** Source-agnostic pitch/chord analyzer. Feed normalized PCM from any accessible source. */
 class PitchAnalyzer(
     val profile: InstrumentProfile = InstrumentProfile.Guitar,
     val mode: DetectionMode = DetectionMode.AUTO,
@@ -26,27 +20,23 @@ class PitchAnalyzer(
         require(autoChordThreshold in 0.0..1.0) { "autoChordThreshold must be between 0 and 1" }
     }
 
-    private var detectorSampleRate: Int = -1
+    private var detectorSampleRate = -1
     private var yin: YinPitchDetector? = null
     private var chordDetector: ChordDetector? = null
-
     private val history = ArrayDeque<String>()
     private var lastStable: TuningResult = TuningResult.Silence
-    private val requiredAgreement = 2
 
-    /** Analyze one PCM frame and return the current stable result. */
     fun process(frame: AudioFrame): TuningResult {
         if (frame.samples.isEmpty()) return TuningResult.Silence
-
         ensureDetectors(frame.sampleRate)
+
         val buffer = preProcess(frame.toMono(), frame.sampleRate)
-        if (buffer.isEmpty()) return TuningResult.Silence
+        if (buffer.size < 64) return TuningResult.Silence
 
         val energy = buffer.fold(0.0) { total, sample ->
             total + sample.toDouble() * sample.toDouble()
         } / buffer.size
         val rms = sqrt(energy)
-
         if (rms < profile.rmsGate) {
             chordDetector?.reset()
             return smooth(TuningResult.Silence)
@@ -57,11 +47,9 @@ class PitchAnalyzer(
             DetectionMode.CHORD -> detectChord(buffer)
             DetectionMode.AUTO -> detectAuto(buffer)
         }
-
         return smooth(result)
     }
 
-    /** Clears temporal/hysteresis state when seeking or switching audio sources. */
     fun reset() {
         history.clear()
         lastStable = TuningResult.Silence
@@ -74,83 +62,62 @@ class PitchAnalyzer(
             freq = frequency,
             useFlats = profile.useFlats,
             referenceA4Hz = referenceA4Hz,
-        )?.let {
-            TuningResult.Note(
-                name = it.name,
-                cents = it.cents,
-                freq = it.frequency,
-            )
-        } ?: TuningResult.Silence
-    }
-
-    private fun detectChord(buffer: FloatArray): TuningResult {
-        return chordDetector
-            ?.detect(buffer, minScore = chordMinScore)
-            ?.let { TuningResult.Chord(it.name) }
+        )?.let { TuningResult.Note(it.name, it.cents, it.frequency) }
             ?: TuningResult.Silence
     }
 
+    private fun detectChord(buffer: FloatArray): TuningResult =
+        chordDetector?.detect(buffer, chordMinScore)
+            ?.let { TuningResult.Chord(it.name) }
+            ?: TuningResult.Silence
+
     private fun detectAuto(buffer: FloatArray): TuningResult {
         val detector = chordDetector ?: return TuningResult.Silence
-        val chroma = detector.chroma(buffer)
-        val strongPitchClasses = chroma.count { it > autoChordThreshold }
+        val strongPitchClasses = detector.chroma(buffer).count { it > autoChordThreshold }
         return if (strongPitchClasses <= 1) detectNote(buffer) else detectChord(buffer)
     }
 
     private fun ensureDetectors(sampleRate: Int) {
         if (sampleRate == detectorSampleRate && yin != null && chordDetector != null) return
-
         detectorSampleRate = sampleRate
         yin = YinPitchDetector(sampleRate)
-        chordDetector = ChordDetector(
-            sampleRate = sampleRate,
-            profile = profile,
-            referenceA4Hz = referenceA4Hz,
-        )
+        chordDetector = ChordDetector(sampleRate, profile, referenceA4Hz)
         reset()
     }
 
-    /** DC removal followed by a real low-cut filter (30 Hz by default). */
     private fun preProcess(raw: FloatArray, sampleRate: Int): FloatArray {
         if (raw.isEmpty()) return raw
+        val output = raw.copyOf()
+        val mean = output.average().toFloat()
+        for (i in output.indices) output[i] -= mean
+        if (highPassCutoffHz == 0.0) return output
 
-        val out = raw.copyOf()
-        val mean = out.average().toFloat()
-        for (i in out.indices) out[i] -= mean
-
-        if (highPassCutoffHz == 0.0) return out
-
-        val dt = 1.0 / sampleRate.toDouble()
+        val dt = 1.0 / sampleRate
         val rc = 1.0 / (2.0 * PI * highPassCutoffHz)
         val alpha = (rc / (rc + dt)).toFloat()
-
         var previousInput = 0f
         var previousOutput = 0f
-        for (i in out.indices) {
-            val input = out[i]
-            val output = alpha * (previousOutput + input - previousInput)
+        for (i in output.indices) {
+            val input = output[i]
+            val filtered = alpha * (previousOutput + input - previousInput)
             previousInput = input
-            previousOutput = output
-            out[i] = output
+            previousOutput = filtered
+            output[i] = filtered
         }
-        return out
+        return output
     }
 
-    /** Require repeated agreement before exposing a new stable result. */
     private fun smooth(result: TuningResult): TuningResult {
         val key = when (result) {
             is TuningResult.Note -> "note:${result.name}"
             is TuningResult.Chord -> "chord:${result.name}"
             TuningResult.Silence -> "silence"
         }
-
         history.addLast(key)
         if (history.size > 4) history.removeFirst()
 
-        val agreement = history.count { it == key }
-        if (agreement >= requiredAgreement) {
-            lastStable = result
-        }
+        val requiredAgreement = if (mode == DetectionMode.NOTE) 1 else 2
+        if (history.count { it == key } >= requiredAgreement) lastStable = result
         return lastStable
     }
 }
