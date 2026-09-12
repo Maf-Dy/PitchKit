@@ -20,19 +20,16 @@ internal object NoteMapper {
         val frequency: Float,
     )
 
-    /**
-     * Converts a frequency to the nearest equal-tempered note using a configurable
-     * A4 reference (440 Hz by default).
-     */
+    /** Converts a frequency to the nearest equal-tempered note. */
     fun frequencyToNote(
         freq: Float,
         useFlats: Boolean = false,
         referenceA4Hz: Double = 440.0,
     ): NoteResult? {
-        if (freq <= 0) return null
+        if (freq <= 0f) return null
         require(referenceA4Hz > 0.0) { "referenceA4Hz must be > 0" }
 
-        val midi = 69 + 12 * log2(freq / referenceA4Hz)
+        val midi = 69.0 + 12.0 * log2(freq.toDouble() / referenceA4Hz)
         val nearest = midi.roundToInt()
         val cents = (midi - nearest) * 100.0
 
@@ -44,5 +41,5 @@ internal object NoteMapper {
         return NoteResult(name, "$name$octave", cents, freq)
     }
 
-    private fun log2(x: Double) = ln(x) / ln(2.0)
+    private fun log2(value: Double): Double = ln(value) / ln(2.0)
 }
