@@ -16,6 +16,8 @@ internal class ChordDetector(
     private val templates = buildTemplates()
     private var currentChord: String? = null
     private var currentScore = 0.0
+    private var pendingChord: String? = null
+    private var pendingCount = 0
     private val chromaHistory = ArrayDeque<DoubleArray>()
     private val chromaWindow = 3
 
@@ -102,7 +104,10 @@ internal class ChordDetector(
         val mags = FFT.magnitudePadded(buffer, padFactor = 2)
         val n = mags.size * 2
         val chroma = smoothedChroma(chromaFrom(mags, n))
-        if (chroma.sum() < 0.5) return null
+        if (chroma.sum() < 0.5) {
+            clearPending()
+            return null
+        }
 
         val bass = detectBassPitchClass(mags, n)
         var best: Template? = null
@@ -128,15 +133,32 @@ internal class ChordDetector(
             }
         }
 
-        if (bestScore < minScore) return null
-        val candidate = best?.name ?: return null
+        if (bestScore < minScore) {
+            clearPending()
+            return null
+        }
 
-        val switchMargin = 0.08
+        val candidate = best?.name ?: return null
         if (candidate == currentChord) {
             currentScore = bestScore
-        } else if (currentChord == null || bestScore > currentScore + switchMargin) {
+            clearPending()
+            return ChordResult(candidate, bestScore)
+        }
+
+        if (candidate == pendingChord) {
+            pendingCount++
+        } else {
+            pendingChord = candidate
+            pendingCount = 1
+        }
+
+        // First valid chord is immediate. Later changes need two consecutive
+        // candidate frames. This prevents flicker without permanently favouring a
+        // previously high-scoring chord over a legitimate lower-scoring next one.
+        if (currentChord == null || pendingCount >= 2) {
             currentChord = candidate
             currentScore = bestScore
+            clearPending()
         }
 
         return currentChord?.let { ChordResult(it, currentScore) }
@@ -145,12 +167,18 @@ internal class ChordDetector(
     fun reset() {
         currentChord = null
         currentScore = 0.0
+        clearPending()
         chromaHistory.clear()
     }
 
     fun chroma(buffer: FloatArray): DoubleArray {
         val mags = FFT.magnitudePadded(buffer, padFactor = 2)
         return chromaFrom(mags, n = mags.size * 2)
+    }
+
+    private fun clearPending() {
+        pendingChord = null
+        pendingCount = 0
     }
 
     private fun midiForFrequency(freq: Double): Double {
