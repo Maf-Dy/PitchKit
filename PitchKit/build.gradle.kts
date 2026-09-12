@@ -12,17 +12,19 @@ android {
 
     defaultConfig {
         minSdk = 28
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
     buildFeatures {
         compose = true
         buildConfig = true
     }
+
     publishing {
         singleVariant("release") {
             withSourcesJar()
@@ -41,10 +43,10 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.compose.runtime)
     implementation(libs.androidx.core.ktx)
-    // Coroutines
+
     implementation(libs.coroutine.core)
     implementation(libs.coroutine.android)
-    // Unit Test
+
     androidTestImplementation(platform(libs.androidx.compose.bom))
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
@@ -54,9 +56,9 @@ dependencies {
 publishing {
     publications {
         register<MavenPublication>("release") {
-            groupId = "com.github.NicosNicolaou16"
+            groupId = System.getenv("GROUP") ?: "com.github.NicosNicolaou16"
             artifactId = "PitchKit"
-            version = "1.0.1"
+            version = System.getenv("VERSION") ?: "1.0.1"
             afterEvaluate {
                 from(components["release"])
             }
