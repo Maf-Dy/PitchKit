@@ -26,32 +26,25 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nicos.pitchkit.BuildConfig
-import com.nicos.pitchkit.tuner.extensions.toPublic
 import com.nicos.pitchkit.tuner.models.InstrumentProfile
 
 /**
- * Runs the tuner and streams typed [TuningResult] values back through [onResult].
- * Handles the microphone permission internally (including the rationale popup and
- * the permanently-denied → Settings path), so the caller only handles results.
+ * Android/Compose microphone convenience wrapper around [PitchAnalyzer].
  *
- * @param profile the instrument to tune/detect for. Defaults to [InstrumentProfile.Guitar].
- * @param titleText shown in the popup title.
- * @param permanentlyDeniedText shown in the popup when the user has permanently
- * denied the permission (the button then opens Settings).
- * @param rationaleText shown in the popup when the permission can still be requested.
- * @param openSettingsText label for the confirm button when the permission is
- * permanently denied, and it opens Settings.
- * @param allowText label for the confirm button when the permission can still be requested.
- * @param dismissText label for the dismiss button.
- * @param onResult called with each detection result ([TuningResult.Note],
- * [TuningResult.Chord], or [TuningResult.Silence]).
+ * Use [PitchAnalyzer] directly when the PCM source is a file, USB device,
+ * playback capture, Media3 pipeline, or anything other than this app's mic.
  */
 @Composable
 fun GuitarTunerListener(
     profile: InstrumentProfile = InstrumentProfile.Guitar,
+    mode: DetectionMode = DetectionMode.AUTO,
+    referenceA4Hz: Double = 440.0,
+    highPassCutoffHz: Double = 30.0,
+    autoChordThreshold: Double = 0.30,
+    chordMinScore: Double = 0.20,
     titleText: String = "Microphone needed",
-    permanentlyDeniedText: String = "Microphone access is blocked. Please enable it in Settings to tune your guitar.",
-    rationaleText: String = "This app needs microphone access to detect notes and chords from your guitar.",
+    permanentlyDeniedText: String = "Microphone access is blocked. Please enable it in Settings.",
+    rationaleText: String = "This app needs microphone access to detect notes and chords.",
     openSettingsText: String = "Open Settings",
     allowText: String = "Allow",
     dismissText: String = "Not now",
@@ -63,7 +56,8 @@ fun GuitarTunerListener(
     var granted by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
-                context, Manifest.permission.RECORD_AUDIO
+                context,
+                Manifest.permission.RECORD_AUDIO,
             ) == PackageManager.PERMISSION_GRANTED
         )
     }
@@ -77,21 +71,21 @@ fun GuitarTunerListener(
         if (!isGranted) {
             permanentlyDenied = activity?.let {
                 !ActivityCompat.shouldShowRequestPermissionRationale(
-                    it, Manifest.permission.RECORD_AUDIO
+                    it,
+                    Manifest.permission.RECORD_AUDIO,
                 )
             } ?: false
             showDialog = true
         }
     }
 
-    // Re-check on resume so returning from Settings (where the user may have
-    // granted it) picks the permission up automatically.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 granted = ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.RECORD_AUDIO
+                    context,
+                    Manifest.permission.RECORD_AUDIO,
                 ) == PackageManager.PERMISSION_GRANTED
                 if (granted) showDialog = false
             }
@@ -100,63 +94,75 @@ fun GuitarTunerListener(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Request on first appearance if not already granted.
     LaunchedEffect(Unit) {
         if (!granted) launcher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
-    // ---- Engine + collection, active only while permission is held ----
     if (granted) {
-        val engine = remember(granted) { TunerEngine(profile = profile) }
-        LaunchedEffect(granted) {
-            engine.start().collect { result ->
-                val tuningResult: TuningResult = result.toPublic()
-                if (BuildConfig.DEBUG) {
-                    // For internal/debug purpose
-                    val finalResult = when (result) {
-                        is TunerEngine.Result.Note ->
-                            "${result.name} ${result.freq} (${"%.0f".format(result.cents)}¢)"
+        val engine = remember(
+            profile,
+            mode,
+            referenceA4Hz,
+            highPassCutoffHz,
+            autoChordThreshold,
+            chordMinScore,
+        ) {
+            TunerEngine(
+                profile = profile,
+                mode = mode,
+                referenceA4Hz = referenceA4Hz,
+                highPassCutoffHz = highPassCutoffHz,
+                autoChordThreshold = autoChordThreshold,
+                chordMinScore = chordMinScore,
+            )
+        }
 
-                        is TunerEngine.Result.Chord -> result.name
-                        TunerEngine.Result.Silence -> "—"
+        LaunchedEffect(engine) {
+            engine.start().collect { result ->
+                if (BuildConfig.DEBUG) {
+                    val debugValue = when (result) {
+                        is TuningResult.Note ->
+                            "${result.name} ${result.freq} (${"%.0f".format(result.cents)}c)"
+                        is TuningResult.Chord -> result.name
+                        TuningResult.Silence -> "-"
                     }
-                    Log.d("GuitarTuner", finalResult)
+                    Log.d("PitchKit", debugValue)
                 }
-                onResult(tuningResult)
+                onResult(result)
             }
         }
     }
 
-    // ---- Popup when permission is missing ----
     if (showDialog) {
         AlertDialog(
             onDismissRequest = { showDialog = false },
             title = { Text(titleText) },
             text = {
-                Text(
-                    if (permanentlyDenied) permanentlyDeniedText
-                    else rationaleText
-                )
+                Text(if (permanentlyDenied) permanentlyDeniedText else rationaleText)
             },
             confirmButton = {
-                TextButton(onClick = {
-                    showDialog = false
-                    if (permanentlyDenied) {
-                        val intent = Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", context.packageName, null)
-                        )
-                        context.startActivity(intent)
-                    } else {
-                        launcher.launch(Manifest.permission.RECORD_AUDIO)
+                TextButton(
+                    onClick = {
+                        showDialog = false
+                        if (permanentlyDenied) {
+                            val intent = Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.fromParts("package", context.packageName, null),
+                            )
+                            context.startActivity(intent)
+                        } else {
+                            launcher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
                     }
-                }) {
+                ) {
                     Text(if (permanentlyDenied) openSettingsText else allowText)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showDialog = false }) { Text(dismissText) }
-            }
+                TextButton(onClick = { showDialog = false }) {
+                    Text(dismissText)
+                }
+            },
         )
     }
 }
