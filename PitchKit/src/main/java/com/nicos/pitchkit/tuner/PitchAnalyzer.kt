@@ -43,7 +43,7 @@ class PitchAnalyzer(
         if (buffer.isEmpty()) return TuningResult.Silence
 
         val energy = buffer.fold(0.0) { total, sample ->
-            total + sample * sample
+            total + sample.toDouble() * sample.toDouble()
         } / buffer.size
         val rms = sqrt(energy)
 
@@ -120,7 +120,7 @@ class PitchAnalyzer(
 
         if (highPassCutoffHz == 0.0) return out
 
-        val dt = 1.0 / sampleRate
+        val dt = 1.0 / sampleRate.toDouble()
         val rc = 1.0 / (2.0 * PI * highPassCutoffHz)
         val alpha = (rc / (rc + dt)).toFloat()
 
