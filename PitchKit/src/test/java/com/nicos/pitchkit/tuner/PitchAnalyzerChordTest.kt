@@ -21,6 +21,8 @@ class PitchAnalyzerChordTest {
             "G" to intArrayOf(43, 47, 50, 55, 59, 67),
             "Am" to intArrayOf(45, 52, 57, 60, 64),
             "Em" to intArrayOf(40, 47, 52, 55, 59, 64),
+            "F#ø7" to intArrayOf(54, 57, 60, 64),
+            "F#dim7" to intArrayOf(54, 57, 60, 63),
         )
 
         for ((expectedChord, midiNotes) in cases) {
