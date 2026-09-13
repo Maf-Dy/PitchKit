@@ -24,6 +24,19 @@ internal data class LvChordiaDecodedFrame(
     val confidence: Double,
 )
 
+internal data class LvChordiaCandidateDiagnostic(
+    val rawLabel: String,
+    val displayLabel: String?,
+    val confidence: Double,
+    val logScore: Double,
+)
+
+internal data class LvChordiaFrameDiagnostic(
+    val frame: Int,
+    val topCandidates: List<LvChordiaCandidateDiagnostic>,
+    val headSummary: String,
+)
+
 internal object LvChordiaDictionaryParser {
     fun parse(json: String, preferFlats: Boolean): LvChordiaDictionary {
         val root = JSONObject(json)
@@ -67,6 +80,13 @@ internal class LvChordiaDictionaryDecoder(
     private val ninthIndex = IntArray(candidateCount) { candidates[it].ninth }
     private val eleventhIndex = IntArray(candidateCount) { candidates[it].eleventh }
     private val thirteenthIndex = IntArray(candidateCount) { candidates[it].thirteenth }
+
+    private val diagnosticRoots = arrayOf("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
+    private val diagnosticTriads = arrayOf("maj", "min", "sus4", "sus2", "dim", "aug")
+    private val diagnosticSevenths = arrayOf("none", "7", "b7", "bb7")
+    private val diagnosticNinths = arrayOf("none", "9", "#9", "b9")
+    private val diagnosticElevenths = arrayOf("none", "11", "#11")
+    private val diagnosticThirteenths = arrayOf("none", "13/6", "b13")
 
     init {
         require(candidateCount > 0)
@@ -148,6 +168,107 @@ internal class LvChordiaDictionaryDecoder(
             )
         }
     }
+
+    /**
+     * Debug-only helper used by the song analyzer after decoding. It intentionally
+     * ranks candidates using only the acoustic observation at each requested frame,
+     * before the HMM transition penalty is applied.
+     */
+    fun diagnoseFrames(
+        heads: LvChordiaHeads,
+        frameIndices: IntArray,
+        limit: Int = 3,
+    ): List<LvChordiaFrameDiagnostic> {
+        if (heads.frames <= 0 || frameIndices.isEmpty()) return emptyList()
+        val safeLimit = limit.coerceIn(1, candidateCount)
+        val logs = LoggedHeads(heads)
+
+        return frameIndices.distinct().mapNotNull { frame ->
+            if (frame !in 0 until heads.frames) return@mapNotNull null
+
+            val topIndices = IntArray(safeLimit) { -1 }
+            val topScores = DoubleArray(safeLimit) { Double.NEGATIVE_INFINITY }
+            for (candidateIndex in 0 until candidateCount) {
+                val score = observationLog(logs, frame, candidateIndex)
+                for (slot in 0 until safeLimit) {
+                    if (score > topScores[slot]) {
+                        for (shift in safeLimit - 1 downTo slot + 1) {
+                            topScores[shift] = topScores[shift - 1]
+                            topIndices[shift] = topIndices[shift - 1]
+                        }
+                        topScores[slot] = score
+                        topIndices[slot] = candidateIndex
+                        break
+                    }
+                }
+            }
+
+            LvChordiaFrameDiagnostic(
+                frame = frame,
+                topCandidates = topIndices.mapIndexedNotNull { slot, candidateIndex ->
+                    if (candidateIndex < 0) return@mapIndexedNotNull null
+                    val candidate = candidates[candidateIndex]
+                    LvChordiaCandidateDiagnostic(
+                        rawLabel = candidate.rawLabel,
+                        displayLabel = candidate.displayLabel,
+                        confidence = observationConfidence(heads, frame, candidate),
+                        logScore = topScores[slot],
+                    )
+                },
+                headSummary = headSummary(heads, frame),
+            )
+        }
+    }
+
+    private fun headSummary(heads: LvChordiaHeads, frame: Int): String = buildString {
+        append("triad[")
+        append(topHead(heads.triad, frame, LvChordiaContract.TRIAD_COUNT, ::triadName))
+        append("] bass[")
+        append(topHead(heads.bass, frame, LvChordiaContract.BASS_COUNT, ::bassName))
+        append("] 7[")
+        append(topHead(heads.seventh, frame, LvChordiaContract.SEVENTH_COUNT) { diagnosticSevenths.getOrElse(it) { it.toString() } })
+        append("] 9[")
+        append(topHead(heads.ninth, frame, LvChordiaContract.NINTH_COUNT) { diagnosticNinths.getOrElse(it) { it.toString() } })
+        append("] 11[")
+        append(topHead(heads.eleventh, frame, LvChordiaContract.ELEVENTH_COUNT) { diagnosticElevenths.getOrElse(it) { it.toString() } })
+        append("] 13[")
+        append(topHead(heads.thirteenth, frame, LvChordiaContract.THIRTEENTH_COUNT) { diagnosticThirteenths.getOrElse(it) { it.toString() } })
+        append(']')
+    }
+
+    private fun topHead(
+        values: FloatArray,
+        frame: Int,
+        width: Int,
+        name: (Int) -> String,
+    ): String {
+        var first = -1
+        var second = -1
+        val offset = frame * width
+        for (index in 0 until width) {
+            if (first < 0 || values[offset + index] > values[offset + first]) {
+                second = first
+                first = index
+            } else if (second < 0 || values[offset + index] > values[offset + second]) {
+                second = index
+            }
+        }
+        return buildString {
+            if (first >= 0) append("${name(first)}=${"%.3f".format(values[offset + first])}")
+            if (second >= 0) append(",${name(second)}=${"%.3f".format(values[offset + second])}")
+        }
+    }
+
+    private fun triadName(index: Int): String {
+        if (index == 0) return "N"
+        val zeroBased = index - 1
+        val quality = diagnosticTriads.getOrElse(zeroBased / 12) { "triad${zeroBased / 12}" }
+        val root = diagnosticRoots[zeroBased % 12]
+        return "$root:$quality"
+    }
+
+    private fun bassName(index: Int): String =
+        if (index == 0) "none" else diagnosticRoots.getOrElse(index - 1) { index.toString() }
 
     private fun observationLog(logs: LoggedHeads, frame: Int, candidateIndex: Int): Double {
         var score = logs.triad[
