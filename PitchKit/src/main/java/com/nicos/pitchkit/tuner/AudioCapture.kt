@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -11,66 +12,163 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 internal class AudioCapture(
-    val sampleRate: Int = 44100,        // 44.1 kHz — standard, captures up to ~22 kHz (Nyquist)
-    val bufferSize: Int = 8192,         // MUST be power of 2 for the FFT. ~186ms of audio.
+    private val preferredSampleRate: Int = 44100,
+    private val bufferSize: Int = 8192,
+    private val preferredAudioSource: Int = MediaRecorder.AudioSource.MIC,
 ) {
-    // Bigger buffer = better low-freq resolution (needed for
-    // low E at 82 Hz) but slower updates.
+    private companion object {
+        const val BUFFER_POOL_SIZE = 3
+    }
+
     private var recorder: AudioRecord? = null
-    private var job: Job? = null   // the coroutine doing the reading, so we can cancel it
+    private var job: Job? = null
+    private var activeSampleRate: Int = preferredSampleRate
+    private var activeAudioSource: Int = preferredAudioSource
 
-    // The OS tells us the smallest buffer it will accept for these settings.
-    // If we request less than this, AudioRecord fails to initialize.
-    private val minBuf = AudioRecord.getMinBufferSize(
-        sampleRate,
-        AudioFormat.CHANNEL_IN_MONO,
-        AudioFormat.ENCODING_PCM_16BIT
-    )
+    private val poolLock = Any()
+    private val floatBufferPool = ArrayDeque<FloatArray>()
 
-    @SuppressLint("MissingPermission") // caller must hold RECORD_AUDIO permission at runtime
-    fun start(scope: CoroutineScope, onBuffer: (FloatArray) -> Unit) {
-        // Internal OS buffer should be larger than our read chunk so audio isn't
-        // dropped if our processing thread briefly stalls. We double it for headroom.
-        val recordBuf = maxOf(minBuf, bufferSize * 2)
+    @SuppressLint("MissingPermission")
+    fun start(
+        scope: CoroutineScope,
+        onBuffer: (samples: FloatArray, sampleRate: Int) -> Unit,
+    ) {
+        check(recorder == null) { "AudioCapture is already running" }
+        resetPool()
 
-        recorder = AudioRecord(
-            // MIC = raw mic. VOICE_RECOGNITION often disables OS-level noise
-            // suppression/AGC, which is BETTER for us — we want the untouched signal.
+        val sources = listOf(
+            preferredAudioSource,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.MIC,
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,        // guitar is mono; one channel is enough
-            AudioFormat.ENCODING_PCM_16BIT,     // 16-bit samples: values -32768..32767
-            recordBuf
-        )
-        recorder?.startRecording()
+        ).distinct()
+        val rates = listOf(preferredSampleRate, 44100, 48000).distinct()
 
-        // All audio reading + processing happens on THIS background thread,
-        // never the UI thread (reading blocks until samples are available).
+        var selected: AudioRecord? = null
+        var selectedRate = preferredSampleRate
+        var selectedSource = preferredAudioSource
+
+        outer@ for (rate in rates) {
+            val minimumBuffer = AudioRecord.getMinBufferSize(
+                rate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            )
+            if (minimumBuffer <= 0) continue
+
+            for (source in sources) {
+                val candidate = runCatching {
+                    AudioRecord(
+                        source,
+                        rate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        maxOf(minimumBuffer, bufferSize * 2),
+                    )
+                }.getOrNull() ?: continue
+
+                if (candidate.state != AudioRecord.STATE_INITIALIZED) {
+                    candidate.release()
+                    continue
+                }
+
+                val started = runCatching {
+                    candidate.startRecording()
+                    candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING
+                }.getOrDefault(false)
+
+                if (!started) {
+                    candidate.release()
+                    continue
+                }
+
+                selected = candidate
+                selectedRate = rate
+                selectedSource = source
+                break@outer
+            }
+        }
+
+        recorder = selected ?: error("No supported AudioRecord configuration was available")
+        activeSampleRate = selectedRate
+        activeAudioSource = selectedSource
+
+        Log.i(
+            "PitchKitAudio",
+            "AudioRecord started source=${sourceName(activeAudioSource)}($activeAudioSource) rate=$activeSampleRate buffer=$bufferSize",
+        )
+
         job = scope.launch(Dispatchers.IO) {
-            val shortBuf = ShortArray(bufferSize)   // raw 16-bit samples from hardware
-            val floatBuf = FloatArray(bufferSize)   // normalized copy for DSP math
+            val shorts = ShortArray(bufferSize)
+            var consecutiveFailures = 0
+
             while (isActive) {
-                // read() blocks until it fills the buffer (or returns fewer samples).
-                val read = recorder?.read(shortBuf, 0, bufferSize) ?: 0
+                val read = recorder?.read(shorts, 0, bufferSize) ?: 0
                 if (read > 0) {
-                    // Convert 16-bit int range to floating-point -1.0..1.0.
-                    // DSP algorithms are simpler and avoid overflow in float.
-                    for (i in 0 until read) {
-                        floatBuf[i] = shortBuf[i] / 32768f
+                    consecutiveFailures = 0
+                    val pooled = acquireFloatBuffer() ?: continue
+                    for (i in 0 until read) pooled[i] = shorts[i] / 32768f
+
+                    val delivered = if (read == bufferSize) {
+                        pooled
+                    } else {
+                        pooled.copyOf(read).also { recycle(pooled) }
                     }
-                    // Hand a copy to the consumer (copy because we reuse floatBuf next loop).
-                    onBuffer(floatBuf.copyOf(read))
+
+                    try {
+                        onBuffer(delivered, activeSampleRate)
+                    } catch (error: Throwable) {
+                        recycle(delivered)
+                        throw error
+                    }
+                } else {
+                    consecutiveFailures++
+                    if (consecutiveFailures == 1 || consecutiveFailures % 20 == 0) {
+                        Log.w(
+                            "PitchKitAudio",
+                            "AudioRecord.read returned $read from ${sourceName(activeAudioSource)} at $activeSampleRate Hz (failure #$consecutiveFailures)",
+                        )
+                    }
                 }
             }
         }
     }
 
+    fun recycle(buffer: FloatArray) {
+        if (buffer.size != bufferSize) return
+        synchronized(poolLock) {
+            if (floatBufferPool.size < BUFFER_POOL_SIZE) {
+                floatBufferPool.addLast(buffer)
+            }
+        }
+    }
+
     fun stop() {
-        job?.cancel()          // signal the loop to stop
+        job?.cancel()
         job = null
-        if (recorder == null) return   // already stopped — no-op
-        recorder?.stop()
-        recorder?.release()    // release hardware — mandatory, or the mic stays locked
+        val activeRecorder = recorder ?: return
+        runCatching { activeRecorder.stop() }
+        activeRecorder.release()
         recorder = null
+        Log.i("PitchKitAudio", "AudioRecord stopped")
+    }
+
+    private fun resetPool() {
+        synchronized(poolLock) {
+            floatBufferPool.clear()
+            repeat(BUFFER_POOL_SIZE) {
+                floatBufferPool.addLast(FloatArray(bufferSize))
+            }
+        }
+    }
+
+    private fun acquireFloatBuffer(): FloatArray? = synchronized(poolLock) {
+        if (floatBufferPool.isEmpty()) null else floatBufferPool.removeFirst()
+    }
+
+    private fun sourceName(source: Int): String = when (source) {
+        MediaRecorder.AudioSource.MIC -> "MIC"
+        MediaRecorder.AudioSource.VOICE_RECOGNITION -> "VOICE_RECOGNITION"
+        MediaRecorder.AudioSource.UNPROCESSED -> "UNPROCESSED"
+        else -> "SOURCE"
     }
 }
