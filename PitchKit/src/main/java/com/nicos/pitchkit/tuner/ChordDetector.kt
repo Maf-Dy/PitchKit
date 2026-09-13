@@ -56,6 +56,7 @@ internal class ChordDetector(
             "7" to intArrayOf(0,4,7,10), "m7" to intArrayOf(0,3,7,10),
             "maj7" to intArrayOf(0,4,7,11), "sus2" to intArrayOf(0,2,7),
             "sus4" to intArrayOf(0,5,7), "dim" to intArrayOf(0,3,6),
+            "dim7" to intArrayOf(0,3,6,9), "m7b5" to intArrayOf(0,3,6,10),
             "aug" to intArrayOf(0,4,8),
         )
         val out = ArrayList<Template>(roots.size * qualities.size)
@@ -144,7 +145,8 @@ internal class ChordDetector(
             val inMean = inChord / template.pitches.size
             val outMean = outChord / (12 - template.pitches.size)
             val coverage = covered.toDouble() / template.pitches.size
-            var score = 0.70 * inMean + 0.22 * coverage - 0.38 * outMean
+            val specificityBonus = 0.05 * (template.pitches.size - 3) * coverage
+            var score = 0.70 * inMean + 0.22 * coverage - 0.38 * outMean + specificityBonus
             if (bass == template.rootPc) score += 0.08
 
             if (score > bestScore) {
