@@ -1,12 +1,22 @@
 package com.nicos.pitchkit.tuner.harmony.crema
 
+import com.nicos.pitchkit.BuildConfig
+import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
+
+internal data class CremaCandidateDiagnostic(
+    val label: String,
+    val rawLabel: String,
+    val fit: Double,
+    val tagConfidence: Double,
+)
 
 internal data class CremaDecodedChord(
     val label: String,
     val rawLabel: String,
     val confidence: Double,
+    val alternatives: List<CremaCandidateDiagnostic> = emptyList(),
 )
 
 /** Live decoder that fuses Crema's chord tag, root and pitch-content heads. */
@@ -53,6 +63,8 @@ internal class CremaHarmonyDecoder(
 
         var bestIndex = -1
         var bestScore = Double.NEGATIVE_INFINITY
+        val diagnostics = if (BuildConfig.DEBUG) mutableListOf<ScoredCandidate>() else null
+
         for (index in state.labels.indices) {
             val label = state.labels[index]
             val parsed = parse(label) ?: continue
@@ -79,6 +91,15 @@ internal class CremaHarmonyDecoder(
                 bestScore = score
                 bestIndex = index
             }
+
+            diagnostics?.add(
+                ScoredCandidate(
+                    label = noteName(rootPc) + displayQuality(quality),
+                    rawLabel = label,
+                    score = score,
+                    tagConfidence = tagProbability.toDouble(),
+                )
+            )
         }
 
         if (bestIndex < 0) return null
@@ -105,10 +126,24 @@ internal class CremaHarmonyDecoder(
             }
         }
 
+        val alternatives = diagnostics
+            ?.sortedByDescending { it.score }
+            ?.take(3)
+            ?.map {
+                CremaCandidateDiagnostic(
+                    label = it.label,
+                    rawLabel = it.rawLabel,
+                    fit = exp(it.score).coerceIn(0.0, 1.0),
+                    tagConfidence = it.tagConfidence.coerceIn(0.0, 1.0),
+                )
+            }
+            .orEmpty()
+
         return CremaDecodedChord(
             label = label,
             rawLabel = raw,
             confidence = chordTagProbability,
+            alternatives = alternatives,
         )
     }
 
@@ -117,7 +152,7 @@ internal class CremaHarmonyDecoder(
         val count = max(1, end - first)
         for (frame in first until end) {
             val offset = frame * width
-            for (index in 0 until width) result[index] += values[offset + index]
+            for (index in result.indices) result[index] += values[offset + index]
         }
         for (index in result.indices) result[index] /= count.toFloat()
         return result
@@ -154,4 +189,11 @@ internal class CremaHarmonyDecoder(
         "sus4" -> "sus4"
         else -> ":$quality"
     }
+
+    private data class ScoredCandidate(
+        val label: String,
+        val rawLabel: String,
+        val score: Double,
+        val tagConfidence: Double,
+    )
 }
