@@ -83,15 +83,21 @@ class CremaStreamingRecognizer(
 
         logTiming(startedAt, hcqtDoneAt, onnxDoneAt, features.frameCount)
 
-        return stabilizer.update(
-            prediction?.let {
-                ChordRecognition(
-                    label = it.label,
-                    confidence = it.confidence,
-                    backend = "Crema 0.2.0",
-                )
-            }
+        val rawRecognition = prediction?.let {
+            ChordRecognition(
+                label = it.label,
+                confidence = it.confidence,
+                backend = "Crema 0.2.0",
+            )
+        }
+        val emitted = stabilizer.update(rawRecognition)
+        logDecision(
+            rawLabel = prediction?.label,
+            rawModelLabel = prediction?.rawLabel,
+            rawConfidence = prediction?.confidence,
+            emitted = emitted,
         )
+        return emitted
     }
 
     @Synchronized
@@ -116,6 +122,21 @@ class CremaStreamingRecognizer(
         lastInferenceAt = 0L
         stabilizer.reset()
         inferenceCount = 0
+    }
+
+    private fun logDecision(
+        rawLabel: String?,
+        rawModelLabel: String?,
+        rawConfidence: Double?,
+        emitted: ChordRecognition?,
+    ) {
+        if (!BuildConfig.DEBUG) return
+        Log.d(
+            "PitchKitChord",
+            "backend=Crema raw=${rawLabel ?: "N"} model=${rawModelLabel ?: "N"} " +
+                "conf=${rawConfidence?.let { "%.3f".format(it) } ?: "-"} " +
+                "emitted=${emitted?.label ?: "-"}",
+        )
     }
 
     private fun logTiming(
