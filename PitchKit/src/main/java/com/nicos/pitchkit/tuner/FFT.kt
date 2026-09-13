@@ -5,8 +5,48 @@ import kotlin.math.hypot
 import kotlin.math.sin
 
 internal object FFT {
+    /** Reusable storage for callers doing the same transform shape repeatedly. */
+    class MagnitudeWorkspace {
+        private var real = DoubleArray(0)
+        private var imaginary = DoubleArray(0)
+        private var magnitude = DoubleArray(0)
+
+        fun magnitudePadded(samples: FloatArray, padFactor: Int = 2): DoubleArray {
+            if (samples.size < 2) return DoubleArray(0)
+            require(padFactor >= 1) { "padFactor must be >= 1" }
+
+            val base = Integer.highestOneBit(samples.size)
+            val n = base * padFactor
+            require(n and (n - 1) == 0) {
+                "base * padFactor must be a power of two"
+            }
+            ensureSize(n)
+            java.util.Arrays.fill(real, 0.0)
+            java.util.Arrays.fill(imaginary, 0.0)
+
+            for (i in 0 until base) {
+                val window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (base - 1)))
+                real[i] = samples[i] * window
+            }
+
+            transform(real, imaginary)
+            for (index in magnitude.indices) {
+                magnitude[index] = hypot(real[index], imaginary[index])
+            }
+            return magnitude
+        }
+
+        private fun ensureSize(n: Int) {
+            if (real.size == n) return
+            real = DoubleArray(n)
+            imaginary = DoubleArray(n)
+            magnitude = DoubleArray(n / 2)
+        }
+    }
+
     fun transform(re: DoubleArray, im: DoubleArray) {
         val n = re.size
+        require(im.size == n) { "real and imaginary arrays must have equal length" }
         if (n == 1) return
         require(n and (n - 1) == 0) { "length must be power of 2" }
 
@@ -54,21 +94,8 @@ internal object FFT {
         }
     }
 
-    fun magnitudePadded(samples: FloatArray, padFactor: Int = 2): DoubleArray {
-        if (samples.size < 2) return DoubleArray(0)
-        val base = Integer.highestOneBit(samples.size)
-        val n = base * padFactor
-        val re = DoubleArray(n)
-        val im = DoubleArray(n)
-
-        for (i in 0 until base) {
-            val window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (base - 1)))
-            re[i] = samples[i] * window
-        }
-
-        transform(re, im)
-        return DoubleArray(n / 2) { index -> hypot(re[index], im[index]) }
-    }
+    fun magnitudePadded(samples: FloatArray, padFactor: Int = 2): DoubleArray =
+        MagnitudeWorkspace().magnitudePadded(samples, padFactor)
 
     fun interpolatePeak(magnitudes: DoubleArray, bin: Int): Double {
         if (bin <= 0 || bin >= magnitudes.size - 1) return 0.0
