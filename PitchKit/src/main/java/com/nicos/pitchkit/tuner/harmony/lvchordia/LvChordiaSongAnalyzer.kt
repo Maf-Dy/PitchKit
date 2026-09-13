@@ -28,6 +28,12 @@ class LvChordiaSongAnalyzer internal constructor(
         const val MODEL_STEP_FRAMES = MODEL_WINDOW_FRAMES - MODEL_OVERLAP_FRAMES
     }
 
+    private data class DiagnosticSegment(
+        val start: Int,
+        val endExclusive: Int,
+        val label: String?,
+    )
+
     private val frontend = LvChordiaHybridCqtFrontend(lowPlanBytes, highPlanBytes)
     private val runners = modelBytes.map(::LvChordiaOnnxRunner)
     private val inferencePool = Executors.newFixedThreadPool(minOf(3, runners.size))
@@ -99,6 +105,8 @@ class LvChordiaSongAnalyzer internal constructor(
         val decoded = sequenceDecoder.decode(heads)
         val hmmDoneAt = SystemClock.elapsedRealtimeNanos()
         require(decoded.size == frames.size)
+        logHarmonyDiagnostics(decoded, frames, heads)
+
         val chords = buildChordSegments(decoded, frames, finalDuration)
         val result = SongHarmonyAnalysis(
             durationMs = finalDuration,
@@ -166,6 +174,48 @@ class LvChordiaSongAnalyzer internal constructor(
         chords = emptyList(),
         sections = if (durationMs > 0L) listOf(SongSection("A", 0L, durationMs)) else emptyList(),
     )
+
+    private fun logHarmonyDiagnostics(
+        decoded: List<LvChordiaDecodedFrame>,
+        frames: LongArray,
+        heads: LvChordiaHeads,
+    ) {
+        if (!BuildConfig.DEBUG || decoded.isEmpty()) return
+
+        val segments = mutableListOf<DiagnosticSegment>()
+        var start = 0
+        while (start < decoded.size) {
+            val label = decoded[start].label
+            var end = start + 1
+            while (end < decoded.size && decoded[end].label == label) end++
+            segments += DiagnosticSegment(start, end, label)
+            start = end
+        }
+
+        val midpoints = IntArray(segments.size) { index ->
+            val segment = segments[index]
+            (segment.start + segment.endExclusive - 1) / 2
+        }
+        val diagnostics = sequenceDecoder
+            .diagnoseFrames(heads, midpoints, limit = 3)
+            .associateBy { it.frame }
+
+        for ((index, segment) in segments.withIndex()) {
+            val midpoint = midpoints[index]
+            val diagnostic = diagnostics[midpoint] ?: continue
+            val rawTop = diagnostic.topCandidates.joinToString(separator = " | ") { candidate ->
+                "${candidate.displayLabel ?: candidate.rawLabel}=${"%.3f".format(candidate.confidence)}"
+            }
+            val startMs = frameToMs(frames[segment.start])
+            val endFrameIndex = (segment.endExclusive - 1).coerceAtMost(frames.lastIndex)
+            val endMs = frameToMs(frames[endFrameIndex])
+            Log.d(
+                "PitchKitHarmony",
+                "LV ${startMs}-${endMs}ms hmm=${segment.label ?: "N"} " +
+                    "rawTop=[$rawTop] ${diagnostic.headSummary}",
+            )
+        }
+    }
 
     private fun buildChordSegments(
         decoded: List<LvChordiaDecodedFrame>,
