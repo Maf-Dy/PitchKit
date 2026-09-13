@@ -1,5 +1,7 @@
 package com.nicos.pitchkit.tuner.harmony.chordnet
 
+import android.util.Log
+import com.nicos.pitchkit.BuildConfig
 import com.nicos.pitchkit.tuner.harmony.ChordRecognition
 import com.nicos.pitchkit.tuner.harmony.ChordRecognizer
 import com.nicos.pitchkit.tuner.harmony.ChordStabilizer
@@ -99,16 +101,23 @@ class ChordNetStreamingRecognizer(
         )
 
         val prediction = predictions[validFrames - 1]
-        val label = prediction.displayLabel
-        return stabilizer.update(
-            label?.let {
-                ChordRecognition(
-                    label = it,
-                    confidence = prediction.confidence,
-                    backend = "ChordNet 2E1D",
-                )
-            }
-        )
+        val rawRecognition = prediction.displayLabel?.let {
+            ChordRecognition(
+                label = it,
+                confidence = prediction.confidence,
+                backend = "ChordNet 2E1D",
+            )
+        }
+        val emitted = stabilizer.update(rawRecognition)
+        if (BuildConfig.DEBUG) {
+            Log.d(
+                "PitchKitChord",
+                "backend=ChordNet raw=${prediction.displayLabel ?: "N"} " +
+                    "model=${prediction.rawLabel} conf=${"%.3f".format(prediction.confidence)} " +
+                    "emitted=${emitted?.label ?: "-"}",
+            )
+        }
+        return emitted
     }
 
     override fun reset() {
