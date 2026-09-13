@@ -20,3 +20,6 @@ local.properties
 /PitchKit/src/main/assets/crema/*runtime-state*.json
 /PitchKit/src/main/assets/chordnet/*.onnx
 /PitchKit/src/main/assets/chordnet/*.bin
+/PitchKit/src/main/assets/btc/*.onnx
+/PitchKit/src/main/assets/btc/*.bin
+/PitchKit/src/main/assets/btc/*.properties
