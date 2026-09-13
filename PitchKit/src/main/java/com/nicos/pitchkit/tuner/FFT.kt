@@ -44,6 +44,8 @@ internal object FFT {
         }
     }
 
+    private val defaultMagnitudeWorkspace = MagnitudeWorkspace()
+
     fun transform(re: DoubleArray, im: DoubleArray) {
         val n = re.size
         require(im.size == n) { "real and imaginary arrays must have equal length" }
@@ -94,8 +96,9 @@ internal object FFT {
         }
     }
 
+    @Synchronized
     fun magnitudePadded(samples: FloatArray, padFactor: Int = 2): DoubleArray =
-        MagnitudeWorkspace().magnitudePadded(samples, padFactor)
+        defaultMagnitudeWorkspace.magnitudePadded(samples, padFactor)
 
     fun interpolatePeak(magnitudes: DoubleArray, bin: Int): Double {
         if (bin <= 0 || bin >= magnitudes.size - 1) return 0.0
