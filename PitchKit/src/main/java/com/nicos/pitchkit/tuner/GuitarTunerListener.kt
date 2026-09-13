@@ -1,4 +1,5 @@
 package com.nicos.pitchkit.tuner
+// Modified in Maf-Dy/PitchKit fork: DSP correctness, performance, and lifecycle fixes.
 
 import android.Manifest
 import android.app.Activity
@@ -6,7 +7,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
-import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.AlertDialog
@@ -25,30 +25,14 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.nicos.pitchkit.BuildConfig
+import androidx.lifecycle.repeatOnLifecycle
 import com.nicos.pitchkit.tuner.extensions.toPublic
 import com.nicos.pitchkit.tuner.models.InstrumentProfile
 
-/**
- * Runs the tuner and streams typed [TuningResult] values back through [onResult].
- * Handles the microphone permission internally (including the rationale popup and
- * the permanently-denied → Settings path), so the caller only handles results.
- *
- * @param profile the instrument to tune/detect for. Defaults to [InstrumentProfile.Guitar].
- * @param titleText shown in the popup title.
- * @param permanentlyDeniedText shown in the popup when the user has permanently
- * denied the permission (the button then opens Settings).
- * @param rationaleText shown in the popup when the permission can still be requested.
- * @param openSettingsText label for the confirm button when the permission is
- * permanently denied, and it opens Settings.
- * @param allowText label for the confirm button when the permission can still be requested.
- * @param dismissText label for the dismiss button.
- * @param onResult called with each detection result ([TuningResult.Note],
- * [TuningResult.Chord], or [TuningResult.Silence]).
- */
 @Composable
 fun GuitarTunerListener(
     profile: InstrumentProfile = InstrumentProfile.Guitar,
+    mode: TunerMode = TunerMode.AUTO,
     titleText: String = "Microphone needed",
     permanentlyDeniedText: String = "Microphone access is blocked. Please enable it in Settings to tune your guitar.",
     rationaleText: String = "This app needs microphone access to detect notes and chords from your guitar.",
@@ -59,39 +43,40 @@ fun GuitarTunerListener(
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var granted by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
-                context, Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
+                context,
+                Manifest.permission.RECORD_AUDIO,
+            ) == PackageManager.PERMISSION_GRANTED,
         )
     }
     var showDialog by remember { mutableStateOf(false) }
     var permanentlyDenied by remember { mutableStateOf(false) }
 
     val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
+        ActivityResultContracts.RequestPermission(),
     ) { isGranted ->
         granted = isGranted
         if (!isGranted) {
             permanentlyDenied = activity?.let {
                 !ActivityCompat.shouldShowRequestPermissionRationale(
-                    it, Manifest.permission.RECORD_AUDIO
+                    it,
+                    Manifest.permission.RECORD_AUDIO,
                 )
             } ?: false
             showDialog = true
         }
     }
 
-    // Re-check on resume so returning from Settings (where the user may have
-    // granted it) picks the permission up automatically.
-    val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 granted = ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.RECORD_AUDIO
+                    context,
+                    Manifest.permission.RECORD_AUDIO,
                 ) == PackageManager.PERMISSION_GRANTED
                 if (granted) showDialog = false
             }
@@ -100,63 +85,57 @@ fun GuitarTunerListener(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Request on first appearance if not already granted.
     LaunchedEffect(Unit) {
         if (!granted) launcher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
-    // ---- Engine + collection, active only while permission is held ----
     if (granted) {
-        val engine = remember(granted) { TunerEngine(profile = profile) }
-        LaunchedEffect(granted) {
-            engine.start().collect { result ->
-                val tuningResult: TuningResult = result.toPublic()
-                if (BuildConfig.DEBUG) {
-                    // For internal/debug purpose
-                    val finalResult = when (result) {
-                        is TunerEngine.Result.Note ->
-                            "${result.name} ${result.freq} (${"%.0f".format(result.cents)}¢)"
+        val engine = remember(profile, mode) {
+            TunerEngine(profile = profile, mode = mode)
+        }
 
-                        is TunerEngine.Result.Chord -> result.name
-                        TunerEngine.Result.Silence -> "—"
-                    }
-                    Log.d("GuitarTuner", finalResult)
+        DisposableEffect(engine) {
+            onDispose { engine.stop() }
+        }
+
+        LaunchedEffect(engine, lifecycleOwner) {
+            lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                engine.start().collect { result ->
+                    onResult(result.toPublic())
                 }
-                onResult(tuningResult)
             }
         }
     }
 
-    // ---- Popup when permission is missing ----
     if (showDialog) {
         AlertDialog(
             onDismissRequest = { showDialog = false },
             title = { Text(titleText) },
             text = {
-                Text(
-                    if (permanentlyDenied) permanentlyDeniedText
-                    else rationaleText
-                )
+                Text(if (permanentlyDenied) permanentlyDeniedText else rationaleText)
             },
             confirmButton = {
-                TextButton(onClick = {
-                    showDialog = false
-                    if (permanentlyDenied) {
-                        val intent = Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", context.packageName, null)
-                        )
-                        context.startActivity(intent)
-                    } else {
-                        launcher.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                }) {
+                TextButton(
+                    onClick = {
+                        showDialog = false
+                        if (permanentlyDenied) {
+                            context.startActivity(
+                                Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.fromParts("package", context.packageName, null),
+                                ),
+                            )
+                        } else {
+                            launcher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    },
+                ) {
                     Text(if (permanentlyDenied) openSettingsText else allowText)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showDialog = false }) { Text(dismissText) }
-            }
+            },
         )
     }
 }
