@@ -3,12 +3,20 @@ package com.nicos.pitchkit.tuner.harmony.chordnet
 import kotlin.math.exp
 
 object ChordNetPostProcessor {
+    data class CandidatePrediction(
+        val labelIndex: Int,
+        val rawLabel: String,
+        val displayLabel: String?,
+        val confidence: Double,
+    )
+
     data class FramePrediction(
         val frameIndex: Int,
         val labelIndex: Int,
         val rawLabel: String,
         val displayLabel: String?,
         val confidence: Double,
+        val alternatives: List<CandidatePrediction>,
     )
 
     fun decode(
@@ -40,23 +48,49 @@ object ChordNetPostProcessor {
             }
             for (chord in smoothed.indices) smoothed[chord] /= count
 
-            var bestIndex = 0
-            for (chord in 1 until smoothed.size) {
-                if (smoothed[chord] > smoothed[bestIndex]) bestIndex = chord
-            }
-
+            val topIndices = topIndices(smoothed, 3)
+            val bestIndex = topIndices.first()
             val maxLogit = smoothed[bestIndex]
             var denominator = 0.0
             for (value in smoothed) denominator += exp(value - maxLogit)
-            val confidence = if (denominator > 0.0) 1.0 / denominator else 0.0
+            val safeDenominator = denominator.coerceAtLeast(1e-12)
+
+            fun probability(index: Int): Double =
+                exp(smoothed[index] - maxLogit) / safeDenominator
 
             FramePrediction(
                 frameIndex = frame,
                 labelIndex = bestIndex,
                 rawLabel = ChordNetVocabulary.labelAt(bestIndex),
                 displayLabel = ChordNetVocabulary.displayLabel(bestIndex),
-                confidence = confidence,
+                confidence = probability(bestIndex),
+                alternatives = topIndices.map { index ->
+                    CandidatePrediction(
+                        labelIndex = index,
+                        rawLabel = ChordNetVocabulary.labelAt(index),
+                        displayLabel = ChordNetVocabulary.displayLabel(index),
+                        confidence = probability(index),
+                    )
+                },
             )
         }
+    }
+
+    private fun topIndices(values: DoubleArray, count: Int): List<Int> {
+        val limit = count.coerceIn(1, values.size)
+        val top = IntArray(limit) { -1 }
+        for (index in values.indices) {
+            for (slot in 0 until limit) {
+                val current = top[slot]
+                if (current < 0 || values[index] > values[current]) {
+                    for (shift in limit - 1 downTo slot + 1) {
+                        top[shift] = top[shift - 1]
+                    }
+                    top[slot] = index
+                    break
+                }
+            }
+        }
+        return top.filter { it >= 0 }
     }
 }
