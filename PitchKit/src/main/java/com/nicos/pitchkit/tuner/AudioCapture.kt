@@ -1,4 +1,5 @@
 package com.nicos.pitchkit.tuner
+// Modified in Maf-Dy/PitchKit fork: DSP correctness, performance, and lifecycle fixes.
 
 import android.annotation.SuppressLint
 import android.media.AudioFormat
@@ -11,66 +12,72 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 internal class AudioCapture(
-    val sampleRate: Int = 44100,        // 44.1 kHz — standard, captures up to ~22 kHz (Nyquist)
-    val bufferSize: Int = 8192,         // MUST be power of 2 for the FFT. ~186ms of audio.
+    val sampleRate: Int = 44_100,
+    val bufferSize: Int = 8192,
 ) {
-    // Bigger buffer = better low-freq resolution (needed for
-    // low E at 82 Hz) but slower updates.
     private var recorder: AudioRecord? = null
-    private var job: Job? = null   // the coroutine doing the reading, so we can cancel it
+    private var job: Job? = null
 
-    // The OS tells us the smallest buffer it will accept for these settings.
-    // If we request less than this, AudioRecord fails to initialize.
-    private val minBuf = AudioRecord.getMinBufferSize(
+    private val minBufferSize = AudioRecord.getMinBufferSize(
         sampleRate,
         AudioFormat.CHANNEL_IN_MONO,
-        AudioFormat.ENCODING_PCM_16BIT
+        AudioFormat.ENCODING_PCM_16BIT,
     )
 
-    @SuppressLint("MissingPermission") // caller must hold RECORD_AUDIO permission at runtime
+    @SuppressLint("MissingPermission")
     fun start(scope: CoroutineScope, onBuffer: (FloatArray) -> Unit) {
-        // Internal OS buffer should be larger than our read chunk so audio isn't
-        // dropped if our processing thread briefly stalls. We double it for headroom.
-        val recordBuf = maxOf(minBuf, bufferSize * 2)
-
-        recorder = AudioRecord(
-            // MIC = raw mic. VOICE_RECOGNITION often disables OS-level noise
-            // suppression/AGC, which is BETTER for us — we want the untouched signal.
+        stop()
+        val recordBuffer = maxOf(minBufferSize, bufferSize * 2)
+        val audioRecord = AudioRecord(
             MediaRecorder.AudioSource.MIC,
             sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,        // guitar is mono; one channel is enough
-            AudioFormat.ENCODING_PCM_16BIT,     // 16-bit samples: values -32768..32767
-            recordBuf
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            recordBuffer,
         )
-        recorder?.startRecording()
+        if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+            audioRecord.release()
+            return
+        }
 
-        // All audio reading + processing happens on THIS background thread,
-        // never the UI thread (reading blocks until samples are available).
+        recorder = audioRecord
+        audioRecord.startRecording()
         job = scope.launch(Dispatchers.IO) {
-            val shortBuf = ShortArray(bufferSize)   // raw 16-bit samples from hardware
-            val floatBuf = FloatArray(bufferSize)   // normalized copy for DSP math
+            val shorts = ShortArray(bufferSize)
+            val floats = FloatArray(bufferSize)
             while (isActive) {
-                // read() blocks until it fills the buffer (or returns fewer samples).
-                val read = recorder?.read(shortBuf, 0, bufferSize) ?: 0
-                if (read > 0) {
-                    // Convert 16-bit int range to floating-point -1.0..1.0.
-                    // DSP algorithms are simpler and avoid overflow in float.
-                    for (i in 0 until read) {
-                        floatBuf[i] = shortBuf[i] / 32768f
+                var filled = 0
+                while (filled < bufferSize && isActive) {
+                    val read = audioRecord.read(
+                        shorts,
+                        filled,
+                        bufferSize - filled,
+                        AudioRecord.READ_BLOCKING,
+                    )
+                    if (read <= 0) {
+                        filled = 0
+                        break
                     }
-                    // Hand a copy to the consumer (copy because we reuse floatBuf next loop).
-                    onBuffer(floatBuf.copyOf(read))
+                    filled += read
                 }
+                if (filled != bufferSize) continue
+
+                var i = 0
+                while (i < bufferSize) {
+                    floats[i] = shorts[i] / 32768f
+                    i++
+                }
+                onBuffer(floats)
             }
         }
     }
 
     fun stop() {
-        job?.cancel()          // signal the loop to stop
+        job?.cancel()
         job = null
-        if (recorder == null) return   // already stopped — no-op
-        recorder?.stop()
-        recorder?.release()    // release hardware — mandatory, or the mic stays locked
+        val activeRecorder = recorder ?: return
         recorder = null
+        runCatching { activeRecorder.stop() }
+        activeRecorder.release()
     }
 }

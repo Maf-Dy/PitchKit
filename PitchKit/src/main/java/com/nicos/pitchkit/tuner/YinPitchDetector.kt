@@ -1,67 +1,69 @@
 package com.nicos.pitchkit.tuner
+// Modified in Maf-Dy/PitchKit fork: DSP correctness, performance, and lifecycle fixes.
+
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 
 internal class YinPitchDetector(
     private val sampleRate: Int,
-    private val threshold: Double = 0.15   // lower = stricter; 0.10–0.15 works well for guitar
+    private val minFrequency: Double,
+    private val maxFrequency: Double,
+    private val threshold: Double = 0.15,
 ) {
-    /**
-     * Detects the fundamental of a SINGLE note. YIN works in the time domain,
-     * finding the period at which the signal best repeats itself — this resists the
-     * octave errors that plague simple FFT peak-picking. Returns Hz, or -1.
-     */
-    fun detect(buffer: FloatArray): Float {
-        val tau = buffer.size / 2
-        val yin = DoubleArray(tau)
+    private var yin = DoubleArray(0)
 
-        // 1. Difference function: how different is the signal from itself shifted by t?
-        for (t in 1 until tau) {
+    fun detect(buffer: FloatArray): Float {
+        if (buffer.size < 32 || minFrequency <= 0.0 || maxFrequency <= minFrequency) return -1f
+        val maxTau = min(buffer.size / 2 - 1, floor(sampleRate / minFrequency).toInt())
+        val minTau = max(2, floor(sampleRate / maxFrequency).toInt())
+        if (maxTau <= minTau) return -1f
+        if (yin.size < maxTau + 1) yin = DoubleArray(maxTau + 1)
+
+        val compareLength = min(buffer.size / 2, buffer.size - maxTau)
+        if (compareLength <= 0) return -1f
+
+        yin[0] = 1.0
+        var t = 1
+        while (t <= maxTau) {
             var sum = 0.0
-            for (i in 0 until tau) {
+            var i = 0
+            while (i < compareLength) {
                 val delta = buffer[i] - buffer[i + t]
                 sum += delta * delta
+                i++
             }
             yin[t] = sum
+            t++
         }
 
-        // 2. Cumulative mean normalization: lets us use a fixed threshold and avoids
-        //    the trivial t=0 dip.
-        yin[0] = 1.0
-        var runningSum = 0.0
-        for (t in 1 until tau) {
-            runningSum += yin[t]
-            yin[t] *= t / runningSum
+        var running = 0.0
+        t = 1
+        while (t <= maxTau) {
+            running += yin[t]
+            yin[t] = if (running > 0.0) yin[t] * t / running else 1.0
+            t++
         }
 
-        // 3. First dip below threshold = the fundamental (not a harmonic).
-        var tauEstimate = -1
-        var t = 2
-        while (t < tau) {
+        t = minTau
+        while (t <= maxTau) {
             if (yin[t] < threshold) {
-                while (t + 1 < tau && yin[t + 1] < yin[t]) t++
-                tauEstimate = t
-                break
+                while (t + 1 <= maxTau && yin[t + 1] < yin[t]) t++
+                val betterTau = parabolicInterp(yin, t, maxTau)
+                return (sampleRate / betterTau).toFloat()
             }
             t++
         }
-        if (tauEstimate == -1) return -1f
-
-        // 4. Parabolic interpolation around the dip for SUB-SAMPLE period accuracy.
-        //    This is what makes the cents reading precise rather than quantized.
-        val betterTau = parabolicInterp(yin, tauEstimate)
-        return (sampleRate / betterTau).toFloat()
+        return -1f
     }
 
-    /** Fits a parabola through 3 points around the dip to refine the minimum. */
-    private fun parabolicInterp(yin: DoubleArray, tau: Int): Double {
-        val x0 = if (tau > 0) tau - 1 else tau            // left neighbor
-        val x2 = if (tau + 1 < yin.size) tau + 1 else tau // right neighbor
-        // Edge cases where a neighbor doesn't exist: just pick the smaller point.
-        if (x0 == tau) return if (yin[tau] <= yin[x2]) tau.toDouble() else x2.toDouble()
-        if (x2 == tau) return if (yin[tau] <= yin[x0]) tau.toDouble() else x0.toDouble()
-        val s0 = yin[x0]
-        val s1 = yin[tau]
-        val s2 = yin[x2]
-        // Standard vertex-of-parabola formula. denom==0 means flat → no shift.
+    private fun parabolicInterp(values: DoubleArray, tau: Int, maxTau: Int): Double {
+        val x0 = if (tau > 1) tau - 1 else tau
+        val x2 = if (tau < maxTau) tau + 1 else tau
+        if (x0 == tau || x2 == tau) return tau.toDouble()
+        val s0 = values[x0]
+        val s1 = values[tau]
+        val s2 = values[x2]
         val denom = 2 * (2 * s1 - s2 - s0)
         return if (denom == 0.0) tau.toDouble() else tau + (s2 - s0) / denom
     }
