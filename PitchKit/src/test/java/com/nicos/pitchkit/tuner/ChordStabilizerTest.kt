@@ -8,8 +8,8 @@ class ChordStabilizerTest {
     @Test
     fun switchesAfterAgreementEvenWhenNewChordScoreIsLower() {
         val stabilizer = ChordStabilizer()
-        val c = candidate("C", 0.90)
-        val g = candidate("G", 0.70)
+        val c = candidate("C", 0.90, 0.10)
+        val g = candidate("G", 0.70, 0.10)
 
         assertNull(stabilizer.accept(c))
         assertEquals("C", stabilizer.accept(c)?.name)
@@ -18,9 +18,22 @@ class ChordStabilizerTest {
     }
 
     @Test
+    fun ambiguousCandidateNeedsThreeFrameAgreement() {
+        val stabilizer = ChordStabilizer()
+        val c = candidate("C", 0.90, 0.10)
+        val g = candidate("G", 0.70, 0.01)
+
+        stabilizer.accept(c)
+        assertEquals("C", stabilizer.accept(c)?.name)
+        assertEquals("C", stabilizer.accept(g)?.name)
+        assertEquals("C", stabilizer.accept(g)?.name)
+        assertEquals("G", stabilizer.accept(g)?.name)
+    }
+
+    @Test
     fun sameChordCanBeReportedAgainAfterReset() {
         val stabilizer = ChordStabilizer()
-        val c = candidate("C", 0.80)
+        val c = candidate("C", 0.80, 0.10)
 
         stabilizer.accept(c)
         assertEquals("C", stabilizer.accept(c)?.name)
@@ -29,10 +42,10 @@ class ChordStabilizerTest {
         assertEquals("C", stabilizer.accept(c)?.name)
     }
 
-    private fun candidate(name: String, score: Double) = ChordDetector.ChordResult(
+    private fun candidate(name: String, score: Double, confidence: Double) = ChordDetector.ChordResult(
         name = name,
         score = score,
-        confidence = 0.10,
+        confidence = confidence,
         bassPitchClass = 0,
     )
 }
