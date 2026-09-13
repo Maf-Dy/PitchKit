@@ -23,3 +23,6 @@ local.properties
 /PitchKit/src/main/assets/btc/*.onnx
 /PitchKit/src/main/assets/btc/*.bin
 /PitchKit/src/main/assets/btc/*.properties
+/PitchKit/src/main/assets/lvchordia/*.onnx
+/PitchKit/src/main/assets/lvchordia/*.bin
+/PitchKit/src/main/assets/lvchordia/*.json
