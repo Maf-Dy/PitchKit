@@ -43,6 +43,7 @@ import kotlinx.coroutines.withContext
 fun GuitarTunerListener(
     profile: InstrumentProfile = InstrumentProfile.Guitar,
     mode: DetectionMode = DetectionMode.AUTO,
+    chordEngine: ChordEngine = ChordEngine.AUTO,
     referenceA4Hz: Double = 440.0,
     preferFlats: Boolean = false,
     highPassCutoffHz: Double = 30.0,
@@ -75,19 +76,25 @@ fun GuitarTunerListener(
     val chordNetAssetsInstalled = remember(applicationContext) {
         ChordNetAndroidFactory.assetsInstalled(applicationContext)
     }
-    val neuralAssetsInstalled = cremaAssetsInstalled || chordNetAssetsInstalled
+    val selectedNeuralAssetsInstalled = when (chordEngine) {
+        ChordEngine.AUTO -> cremaAssetsInstalled || chordNetAssetsInstalled
+        ChordEngine.CREMA -> cremaAssetsInstalled
+        ChordEngine.CHORD_NET -> chordNetAssetsInstalled
+        ChordEngine.CLASSIC -> false
+    }
 
     var neuralRecognizer by remember { mutableStateOf<ChordRecognizer?>(null) }
     var neuralLoadFailed by remember { mutableStateOf(false) }
 
     LaunchedEffect(
         mode,
+        chordEngine,
         cremaAssetsInstalled,
         chordNetAssetsInstalled,
         referenceA4Hz,
         preferFlats,
     ) {
-        if (mode != DetectionMode.CHORD || !neuralAssetsInstalled) {
+        if (mode != DetectionMode.CHORD || chordEngine == ChordEngine.CLASSIC) {
             neuralRecognizer = null
             neuralLoadFailed = false
             return@LaunchedEffect
@@ -96,8 +103,12 @@ fun GuitarTunerListener(
         neuralLoadFailed = false
         neuralRecognizer = null
         neuralRecognizer = withContext(Dispatchers.IO) {
-            if (cremaAssetsInstalled) {
-                try {
+            fun tryCrema(): ChordRecognizer? {
+                if (!cremaAssetsInstalled) {
+                    if (BuildConfig.DEBUG) Log.d("PitchKit", "Crema assets are not installed")
+                    return null
+                }
+                return try {
                     CremaAndroidFactory.create(
                         context = applicationContext,
                         referenceA4Hz = referenceA4Hz,
@@ -106,26 +117,40 @@ fun GuitarTunerListener(
                         if (BuildConfig.DEBUG) Log.d("PitchKit", "Crema neural recognizer loaded")
                     }
                 } catch (error: Throwable) {
-                    Log.e("PitchKit", "Crema failed to load; using classic DSP fallback (not ChordNet)", error)
+                    Log.e("PitchKit", "Crema failed to load", error)
                     null
                 }
-            } else if (chordNetAssetsInstalled) {
-                try {
+            }
+
+            fun tryChordNet(): ChordRecognizer? {
+                if (!chordNetAssetsInstalled) {
+                    if (BuildConfig.DEBUG) Log.d("PitchKit", "ChordNet assets are not installed")
+                    return null
+                }
+                return try {
                     ChordNetAndroidFactory.create(
                         context = applicationContext,
                         referenceA4Hz = referenceA4Hz,
                     ).also {
-                        if (BuildConfig.DEBUG) Log.d("PitchKit", "ChordNet fallback recognizer loaded")
+                        if (BuildConfig.DEBUG) Log.d("PitchKit", "ChordNet neural recognizer loaded")
                     }
                 } catch (error: Throwable) {
-                    Log.e("PitchKit", "ChordNet failed to load; using classic fallback", error)
+                    Log.e("PitchKit", "ChordNet failed to load", error)
                     null
                 }
-            } else {
-                null
+            }
+
+            when (chordEngine) {
+                ChordEngine.AUTO -> tryCrema() ?: tryChordNet()
+                ChordEngine.CREMA -> tryCrema()
+                ChordEngine.CHORD_NET -> tryChordNet()
+                ChordEngine.CLASSIC -> null
             }
         }
         neuralLoadFailed = neuralRecognizer == null
+        if (neuralLoadFailed && BuildConfig.DEBUG) {
+            Log.d("PitchKit", "${chordEngine.name} unavailable; using Classic DSP")
+        }
     }
 
     DisposableEffect(neuralRecognizer) {
@@ -165,7 +190,8 @@ fun GuitarTunerListener(
     }
 
     val waitingForNeural = mode == DetectionMode.CHORD &&
-        neuralAssetsInstalled &&
+        chordEngine != ChordEngine.CLASSIC &&
+        selectedNeuralAssetsInstalled &&
         neuralRecognizer == null &&
         !neuralLoadFailed
 
@@ -173,6 +199,7 @@ fun GuitarTunerListener(
         val engine = remember(
             profile,
             mode,
+            chordEngine,
             referenceA4Hz,
             highPassCutoffHz,
             autoChordThreshold,
