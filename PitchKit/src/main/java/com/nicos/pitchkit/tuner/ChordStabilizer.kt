@@ -6,6 +6,7 @@ import java.util.ArrayDeque
 internal class ChordStabilizer(
     private val windowSize: Int = 3,
     private val requiredAgreement: Int = 2,
+    private val clearConfidence: Double = 0.04,
 ) {
     data class StableChord(val name: String, val score: Double, val confidence: Double)
 
@@ -23,9 +24,16 @@ internal class ChordStabilizer(
             .groupBy { it.name }
             .maxByOrNull { (_, values) -> values.size }
 
-        if (winner != null && winner.value.size >= requiredAgreement) {
+        if (winner != null) {
             val latest = candidates.last { it.name == winner.key }
-            stable = StableChord(latest.name, latest.score, latest.confidence)
+            val agreementNeeded = if (latest.confidence >= clearConfidence) {
+                requiredAgreement
+            } else {
+                (requiredAgreement + 1).coerceAtMost(windowSize)
+            }
+            if (winner.value.size >= agreementNeeded) {
+                stable = StableChord(latest.name, latest.score, latest.confidence)
+            }
         }
         return stable
     }
