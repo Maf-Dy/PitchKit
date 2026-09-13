@@ -110,11 +110,14 @@ class ChordNetStreamingRecognizer(
         }
         val emitted = stabilizer.update(rawRecognition)
         if (BuildConfig.DEBUG) {
+            val top = prediction.alternatives.joinToString(separator = " | ") { candidate ->
+                "${candidate.displayLabel ?: candidate.rawLabel}=${"%.3f".format(candidate.confidence)}"
+            }
             Log.d(
                 "PitchKitChord",
                 "backend=ChordNet raw=${prediction.displayLabel ?: "N"} " +
                     "model=${prediction.rawLabel} conf=${"%.3f".format(prediction.confidence)} " +
-                    "emitted=${emitted?.label ?: "-"}",
+                    "top3=[$top] emitted=${emitted?.label ?: "-"}",
             )
         }
         return emitted
