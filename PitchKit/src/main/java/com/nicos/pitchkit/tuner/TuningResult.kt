@@ -1,16 +1,7 @@
 package com.nicos.pitchkit.tuner
 
-/**
- * The public result of tuner detection. This is the type library consumers
- * receive — the internal TunerEngine and its own Result type stay hidden.
- */
+/** Public result emitted by [PitchAnalyzer] and the microphone convenience listener. */
 sealed class TuningResult {
-    /**
-     * A single detected note.
-     * @param name  note name, e.g. "E" or "A#".
-     * @param cents deviation from perfect pitch (-50..+50); 0 = in tune.
-     * @param freq  detected frequency in Hz.
-     */
     data class Note(
         val name: String,
         val cents: Double,
@@ -18,11 +9,17 @@ sealed class TuningResult {
     ) : TuningResult()
 
     /**
-     * A detected chord, e.g. "Am" or "Cmaj7".
-     * @param name the chord name.
+     * A chord that passed the active detector's own acceptance rules.
+     *
+     * [confidence] is detector-specific and is primarily diagnostic; callers should
+     * not compare values from different [backend] implementations as if they were
+     * calibrated to the same probability scale.
      */
-    data class Chord(val name: String) : TuningResult()
+    data class Chord(
+        val name: String,
+        val confidence: Double = 1.0,
+        val backend: String = "Unknown",
+    ) : TuningResult()
 
-    /** No sound / below the detection threshold. */
     object Silence : TuningResult()
 }
