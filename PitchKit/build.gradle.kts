@@ -12,7 +12,6 @@ android {
 
     defaultConfig {
         minSdk = 28
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     compileOptions {
@@ -34,6 +33,7 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
@@ -41,10 +41,10 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.compose.runtime)
     implementation(libs.androidx.core.ktx)
-    // Coroutines
     implementation(libs.coroutine.core)
     implementation(libs.coroutine.android)
-    // Unit Test
+    implementation(libs.onnxruntime.android)
+
     androidTestImplementation(platform(libs.androidx.compose.bom))
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
@@ -54,9 +54,9 @@ dependencies {
 publishing {
     publications {
         register<MavenPublication>("release") {
-            groupId = "com.github.NicosNicolaou16"
+            groupId = "com.github.Maf-Dy"
             artifactId = "PitchKit"
-            version = "1.0.1"
+            version = "1.1.0-modern"
             afterEvaluate {
                 from(components["release"])
             }
