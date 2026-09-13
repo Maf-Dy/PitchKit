@@ -13,3 +13,10 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Neural model/runtime artifacts are fetched or generated locally and verified by SHA-256.
+/PitchKit/src/main/assets/crema/*.onnx
+/PitchKit/src/main/assets/crema/*.bin
+/PitchKit/src/main/assets/crema/*runtime-state*.json
+/PitchKit/src/main/assets/chordnet/*.onnx
+/PitchKit/src/main/assets/chordnet/*.bin
