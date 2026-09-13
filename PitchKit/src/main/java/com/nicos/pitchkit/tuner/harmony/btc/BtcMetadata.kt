@@ -13,7 +13,7 @@ data class BtcMetadata(
     companion object {
         fun parse(bytes: ByteArray): BtcMetadata {
             val properties = Properties().apply {
-                ByteArrayInputStream(bytes).use(::load)
+                ByteArrayInputStream(bytes).use { input -> load(input) }
             }
             fun required(name: String): String = properties.getProperty(name)
                 ?.trim()
