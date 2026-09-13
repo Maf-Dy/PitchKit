@@ -1,5 +1,8 @@
 package com.nicos.pitchkit.tuner
 
+import android.media.MediaRecorder
+import com.nicos.pitchkit.tuner.harmony.ChordRecognizer
+import com.nicos.pitchkit.tuner.models.AudioFrame
 import com.nicos.pitchkit.tuner.models.InstrumentProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -7,109 +10,172 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 import kotlin.math.sqrt
 
-/**
- * @param profile    the instrument to tune/detect for. Defaults to guitar so
- *                   existing callers keep working unchanged.
- * @param sampleRate the microphone's sample rate.
- * @param bufferSize the number of samples per frame.
- */
 internal class TunerEngine(
-    private val profile: InstrumentProfile = InstrumentProfile.Guitar,
-    sampleRate: Int = 44100,
+    profile: InstrumentProfile = InstrumentProfile.Guitar,
+    private val mode: DetectionMode = DetectionMode.AUTO,
+    referenceA4Hz: Double = 440.0,
+    highPassCutoffHz: Double = 30.0,
+    autoChordThreshold: Double = 0.30,
+    chordMinScore: Double = 0.20,
+    private val chordRecognizer: ChordRecognizer? = null,
+    preferredSampleRate: Int = 44100,
     bufferSize: Int = 8192,
-) {
-    private val capture = AudioCapture(sampleRate, bufferSize)
-    private val yin = YinPitchDetector(sampleRate)
-
-    // Pass the profile down so the detector uses this instrument's frequency bounds.
-    private val chordDetector = ChordDetector(sampleRate, profile)
-
-    // Loudness gate now comes from the profile rather than being hardcoded.
-    private val rmsGate = profile.rmsGate
-
-    // Exactly one of these per frame; the UI handles each with a `when`.
-    sealed class Result {
-        data class Note(val name: String, val cents: Double, val freq: Float) : Result()
-        data class Chord(val name: String) : Result()
-        object Silence : Result()
+    preferredAudioSource: Int = MediaRecorder.AudioSource.MIC,
+) : AutoCloseable {
+    private companion object {
+        const val CHORD_GATE_ATTACK_FRAMES = 2
+        const val CHORD_GATE_RESET_FRAMES = 4
+        const val CHORD_GATE_OPEN_MULTIPLIER = 1.15
+        const val CHORD_GATE_HOLD_MULTIPLIER = 0.75
     }
 
-    // Debounce state to suppress one-frame flickers.
-    private val history = ArrayDeque<String>()
-    private var lastStable: Result = Result.Silence
-    private val requiredAgreement = 2
+    private val capture = AudioCapture(
+        preferredSampleRate = preferredSampleRate,
+        bufferSize = bufferSize,
+        preferredAudioSource = preferredAudioSource,
+    )
+    private val analyzer = PitchAnalyzer(
+        profile = profile,
+        mode = mode,
+        referenceA4Hz = referenceA4Hz,
+        highPassCutoffHz = highPassCutoffHz,
+        autoChordThreshold = autoChordThreshold,
+        chordMinScore = chordMinScore,
+    )
+    private val chordRmsGate = profile.rmsGate.coerceAtLeast(0.0)
 
-    fun start() = callbackFlow<Result> {
-        capture.start(scope = this) { raw ->
-            val buf = preProcess(raw)   // clean the signal first
+    @Volatile
+    private var closed = false
 
-            // Energy gate: skip frames quieter than the profile's rmsGate.
-            val rms = sqrt(buf.map { (it * it).toDouble() }.average())
-            if (rms < rmsGate) {
-                chordDetector.reset()   // clear hysteresis so the next chord starts clean
-                trySend(Result.Silence)
-                return@start
+    private var chordGateOpen = false
+    private var chordAttackFrames = 0
+    private var chordQuietFrames = 0
+
+    fun start() = callbackFlow<TuningResult> {
+        check(!closed) { "TunerEngine is closed" }
+
+        val frames = Channel<AudioFrame>(
+            capacity = Channel.CONFLATED,
+            onUndeliveredElement = { frame -> capture.recycle(frame.samples) },
+        )
+
+        val processor = launch(Dispatchers.Default) {
+            for (frame in frames) {
+                try {
+                    if (closed) break
+                    val result = if (mode == DetectionMode.CHORD && chordRecognizer != null) {
+                        processNeuralChordFrame(frame)
+                    } else {
+                        analyzer.process(frame)
+                    }
+                    this@callbackFlow.trySend(result)
+                } finally {
+                    capture.recycle(frame.samples)
+                }
             }
+        }
 
-            // Decide single note vs chord by counting strongly-present pitch classes.
-            val chroma = chordDetector.chroma(buf)
-            val strongPitches = chroma.count { it > 0.50 }
-
-            val result = if (strongPitches <= 1) {
-                // Monophonic → YIN for precise pitch + cents. Uses the profile's
-                // flat/sharp preference for the note name.
-                val f = yin.detect(buf)
-                NoteMapper.frequencyToNote(f, useFlats = profile.useFlats)?.let {
-                    Result.Note(it.name, it.cents, it.frequency)
-                } ?: Result.Silence
+        capture.start(scope = this) { samples, actualSampleRate ->
+            if (closed) {
+                capture.recycle(samples)
             } else {
-                // Polyphonic → chord template matching.
-                chordDetector.detect(buf)?.let { Result.Chord(it.name) } ?: Result.Silence
+                val sendResult = frames.trySend(
+                    AudioFrame(
+                        samples = samples,
+                        sampleRate = actualSampleRate,
+                        channelCount = 1,
+                    )
+                )
+                if (sendResult.isFailure) capture.recycle(samples)
+            }
+        }
+
+        awaitClose {
+            frames.cancel()
+            processor.cancel()
+            stop()
+        }
+    }
+        .buffer(Channel.CONFLATED)
+        .flowOn(Dispatchers.IO)
+
+    private fun processNeuralChordFrame(frame: AudioFrame): TuningResult {
+        val rms = frameRms(frame)
+        val openThreshold = chordRmsGate * CHORD_GATE_OPEN_MULTIPLIER
+        val holdThreshold = chordRmsGate * CHORD_GATE_HOLD_MULTIPLIER
+
+        if (!chordGateOpen) {
+            if (rms >= openThreshold) {
+                chordAttackFrames++
+            } else {
+                chordAttackFrames = 0
             }
 
-            trySend(smooth(result))
+            if (chordAttackFrames < CHORD_GATE_ATTACK_FRAMES) {
+                return TuningResult.Silence
+            }
+
+            chordGateOpen = true
+            chordAttackFrames = 0
+            chordQuietFrames = 0
+        } else if (rms < holdThreshold) {
+            chordQuietFrames++
+            if (chordQuietFrames >= CHORD_GATE_RESET_FRAMES) {
+                resetChordGate()
+                chordRecognizer?.reset()
+            }
+            return TuningResult.Silence
+        } else {
+            chordQuietFrames = 0
         }
-        awaitClose { stop() }   // flow cancelled → release the mic
+
+        return chordRecognizer?.recognize(frame)
+            ?.let {
+                TuningResult.Chord(
+                    name = it.label,
+                    confidence = it.confidence,
+                    backend = it.backend,
+                )
+            }
+            ?: TuningResult.Silence
     }
-        .buffer(capacity = Channel.CONFLATED)  // keep only the latest frame under load
-        .flowOn(Dispatchers.IO)                // all audio work off the main thread
 
-    fun stop() = capture.stop()
+    private fun frameRms(frame: AudioFrame): Double {
+        val samples = frame.samples
+        if (samples.isEmpty()) return 0.0
 
-    /** Pre-processing: DC-offset removal + a one-pole high-pass to cut rumble. */
-    private fun preProcess(raw: FloatArray): FloatArray {
-        val out = raw.copyOf()
-        // Remove DC bias so the waveform is centred on zero (pitch math assumes this).
-        val mean = out.average().toFloat()
-        for (i in out.indices) out[i] -= mean
-        // First-order high-pass: attenuates low-frequency rumble.
-        var prev = 0f;
-        var prevOut = 0f
-        val alpha = 0.95f
-        for (i in out.indices) {
-            val cur = out[i]
-            val hp = alpha * (prevOut + cur - prev)
-            prev = cur; prevOut = hp
-            out[i] = hp
+        var energy = 0.0
+        for (sample in samples) {
+            val value = sample.toDouble()
+            energy += value * value
         }
-        return out
+        return sqrt(energy / samples.size)
     }
 
-    /** Debounces output: only updates once one result dominates the recent window. */
-    private fun smooth(r: Result): Result {
-        val key = when (r) {
-            is Result.Note -> r.name
-            is Result.Chord -> r.name
-            Result.Silence -> "~"
-        }
-        history.addLast(key)
-        if (history.size > 4) history.removeFirst()
-        val majority = history.groupingBy { it }.eachCount().maxByOrNull { it.value }
-        if (majority != null && majority.value >= requiredAgreement) {
-            lastStable = r
-        }
-        return lastStable
+    private fun resetChordGate() {
+        chordGateOpen = false
+        chordAttackFrames = 0
+        chordQuietFrames = 0
+    }
+
+    fun stop() {
+        if (closed) return
+        capture.stop()
+        analyzer.reset()
+        chordRecognizer?.reset()
+        resetChordGate()
+    }
+
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        capture.stop()
+        analyzer.reset()
+        chordRecognizer?.reset()
+        resetChordGate()
+        closed = true
     }
 }
