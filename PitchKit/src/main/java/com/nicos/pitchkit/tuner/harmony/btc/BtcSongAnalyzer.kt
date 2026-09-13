@@ -182,7 +182,6 @@ class BtcSongAnalyzer internal constructor(
         }
 
         val rawIndices = IntArray(frameCount)
-        val rawConfidence = DoubleArray(frameCount)
         for (frame in 0 until frameCount) {
             val count = counts[frame].coerceAtLeast(1)
             val offset = frame * BtcContract.CHORD_COUNT
@@ -196,17 +195,34 @@ class BtcSongAnalyzer internal constructor(
                 }
             }
             rawIndices[frame] = best
-
-            var denominator = 0.0
-            for (chord in 0 until BtcContract.CHORD_COUNT) {
-                denominator += exp((accumulator[offset + chord] / count - bestValue).toDouble())
-            }
-            rawConfidence[frame] = if (denominator > 0.0) 1.0 / denominator else 0.0
         }
 
         val filteredIndices = majorityFilter(rawIndices, BtcContract.SMOOTHING_KERNEL)
         return List(frameCount) { frame ->
-            FrameResult(filteredIndices[frame], rawConfidence[frame])
+            val count = counts[frame].coerceAtLeast(1)
+            val offset = frame * BtcContract.CHORD_COUNT
+            var maxLogit = Double.NEGATIVE_INFINITY
+            for (chord in 0 until BtcContract.CHORD_COUNT) {
+                maxLogit = maxOf(maxLogit, (accumulator[offset + chord] / count).toDouble())
+            }
+            var softmaxDenominator = 0.0
+            for (chord in 0 until BtcContract.CHORD_COUNT) {
+                softmaxDenominator += exp(
+                    (accumulator[offset + chord] / count).toDouble() - maxLogit
+                )
+            }
+            val label = filteredIndices[frame]
+            val selectedNumerator = exp(
+                (accumulator[offset + label] / count).toDouble() - maxLogit
+            )
+            FrameResult(
+                labelIndex = label,
+                confidence = if (softmaxDenominator > 0.0) {
+                    selectedNumerator / softmaxDenominator
+                } else {
+                    0.0
+                },
+            )
         }
     }
 
@@ -254,8 +270,8 @@ class BtcSongAnalyzer internal constructor(
                 val source = (frame + offset).coerceIn(0, values.lastIndex)
                 counts[values[source]]++
             }
-            var best = values[frame]
-            for (label in counts.indices) {
+            var best = 0
+            for (label in 1 until counts.size) {
                 if (counts[label] > counts[best]) best = label
             }
             output[frame] = best
