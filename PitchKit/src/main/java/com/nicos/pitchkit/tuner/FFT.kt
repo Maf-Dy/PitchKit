@@ -44,7 +44,9 @@ internal object FFT {
         }
     }
 
-    private val defaultMagnitudeWorkspace = MagnitudeWorkspace()
+    // Pitch analysis already runs on worker threads. Reuse the large FFT arrays on
+    // each worker without sharing a mutable result buffer across analyzer threads.
+    private val magnitudeWorkspace = ThreadLocal.withInitial { MagnitudeWorkspace() }
 
     fun transform(re: DoubleArray, im: DoubleArray) {
         val n = re.size
@@ -96,9 +98,8 @@ internal object FFT {
         }
     }
 
-    @Synchronized
     fun magnitudePadded(samples: FloatArray, padFactor: Int = 2): DoubleArray =
-        defaultMagnitudeWorkspace.magnitudePadded(samples, padFactor)
+        magnitudeWorkspace.get().magnitudePadded(samples, padFactor)
 
     fun interpolatePeak(magnitudes: DoubleArray, bin: Int): Double {
         if (bin <= 0 || bin >= magnitudes.size - 1) return 0.0
