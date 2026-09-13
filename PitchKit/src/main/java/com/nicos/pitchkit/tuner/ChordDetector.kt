@@ -11,6 +11,10 @@ import kotlin.math.pow
 /**
  * Polyphonic chord detector built around note-fundamental salience rather than
  * directly folding every FFT peak into chroma.
+ *
+ * Temporal stability is handled by candidate confirmation, not by averaging old
+ * chroma frames into new audio. This prevents a previous C frame from polluting
+ * the first G frames during a real C -> G transition.
  */
 internal class ChordDetector(
     private val sampleRate: Int,
@@ -36,12 +40,24 @@ internal class ChordDetector(
     )
 
     private val templates = buildTemplates()
+    private val maxFundamental = min(
+        profile.maxFreq,
+        max(profile.bassCeiling * 3.0, profile.harmonicPivot * 6.0),
+    )
+    private val minMidi = floor(midiForFrequency(profile.minFreq)).toInt() - 1
+    private val maxMidi = ceil(midiForFrequency(maxFundamental)).toInt() + 1
+
+    // Reused per-frame scoring storage. The original implementation built twelve
+    // MutableLists, many Pair objects, and sorted every pitch-class list per frame.
+    private val topPitchClassScore = DoubleArray(12)
+    private val secondPitchClassScore = DoubleArray(12)
+    private val chromaScratch = DoubleArray(12)
+    private val noteMidiScratch = IntArray((maxMidi - minMidi + 1).coerceAtLeast(1))
+    private val noteScoreScratch = DoubleArray(noteMidiScratch.size)
+
     private var currentChord: String? = null
-    private var currentScore = 0.0
     private var pendingChord: String? = null
     private var pendingCount = 0
-    private val chromaHistory = ArrayDeque<DoubleArray>()
-    private val chromaWindow = 3
 
     init {
         require(referenceA4Hz > 0.0) { "referenceA4Hz must be > 0" }
@@ -53,7 +69,7 @@ internal class ChordDetector(
         minMargin: Double = 0.035,
     ): ChordResult? {
         val profileNow = buildPitchProfile(buffer)
-        val chroma = smooth(profileNow.chroma)
+        val chroma = profileNow.chroma
         val bass = profileNow.bassPitchClass
 
         var bestTemplate: Template? = null
@@ -80,7 +96,6 @@ internal class ChordDetector(
         }
 
         if (candidate == currentChord) {
-            currentScore = bestScore
             clearPending()
             return ChordResult(candidate, bestScore, margin.coerceAtLeast(0.0))
         }
@@ -92,10 +107,10 @@ internal class ChordDetector(
             pendingCount = 1
         }
 
+        // Never claim the old chord while a different candidate is pending.
         if (pendingCount < 2) return null
 
         currentChord = candidate
-        currentScore = bestScore
         clearPending()
         return ChordResult(candidate, bestScore, margin.coerceAtLeast(0.0))
     }
@@ -104,25 +119,19 @@ internal class ChordDetector(
 
     fun reset() {
         currentChord = null
-        currentScore = 0.0
         clearPending()
-        chromaHistory.clear()
     }
 
     private fun buildPitchProfile(buffer: FloatArray): PitchProfile {
         val magnitudes = FFT.magnitudePadded(buffer, padFactor = 4)
         val fftSize = magnitudes.size * 2
 
-        val maxFundamental = min(
-            profile.maxFreq,
-            max(profile.bassCeiling * 3.0, profile.harmonicPivot * 6.0),
-        )
+        java.util.Arrays.fill(topPitchClassScore, 0.0)
+        java.util.Arrays.fill(secondPitchClassScore, 0.0)
+        java.util.Arrays.fill(chromaScratch, 0.0)
 
-        val minMidi = floor(midiForFrequency(profile.minFreq)).toInt() - 1
-        val maxMidi = ceil(midiForFrequency(maxFundamental)).toInt() + 1
-
-        val perPitchClass = Array(12) { mutableListOf<Double>() }
-        val noteScores = mutableListOf<Pair<Int, Double>>()
+        var noteCount = 0
+        var strongestNote = 0.0
 
         for (midi in minMidi..maxMidi) {
             val frequency = frequencyForMidi(midi)
@@ -136,36 +145,45 @@ internal class ChordDetector(
             if (salience <= 0.0) continue
 
             val pitchClass = floorMod12(midi)
-            perPitchClass[pitchClass].add(salience)
-            noteScores += midi to salience
+            if (salience > topPitchClassScore[pitchClass]) {
+                secondPitchClassScore[pitchClass] = topPitchClassScore[pitchClass]
+                topPitchClassScore[pitchClass] = salience
+            } else if (salience > secondPitchClassScore[pitchClass]) {
+                secondPitchClassScore[pitchClass] = salience
+            }
+
+            if (noteCount < noteScoreScratch.size) {
+                noteMidiScratch[noteCount] = midi
+                noteScoreScratch[noteCount] = salience
+                noteCount++
+            }
+            if (salience > strongestNote) strongestNote = salience
         }
 
-        val chroma = DoubleArray(12)
-        for (pitchClass in chroma.indices) {
-            chroma[pitchClass] = perPitchClass[pitchClass]
-                .sortedDescending()
-                .take(2)
-                .sum()
+        var peak = 0.0
+        for (pitchClass in chromaScratch.indices) {
+            val value = topPitchClassScore[pitchClass] + secondPitchClassScore[pitchClass]
+            chromaScratch[pitchClass] = value
+            if (value > peak) peak = value
         }
-
-        val peak = chroma.maxOrNull() ?: 0.0
         if (peak > 0.0) {
-            for (i in chroma.indices) chroma[i] /= peak
+            for (i in chromaScratch.indices) chromaScratch[i] /= peak
         }
 
-        val strongestNote = noteScores.maxOfOrNull { it.second } ?: 0.0
-        val bass = if (strongestNote > 0.0) {
-            noteScores
-                .asSequence()
-                .filter { (_, score) -> score >= strongestNote * 0.30 }
-                .minByOrNull { (midi, _) -> midi }
-                ?.let { (midi, _) -> floorMod12(midi) }
-                ?: -1
-        } else {
-            -1
+        var bassMidi = Int.MAX_VALUE
+        if (strongestNote > 0.0) {
+            val threshold = strongestNote * 0.30
+            for (index in 0 until noteCount) {
+                if (noteScoreScratch[index] >= threshold && noteMidiScratch[index] < bassMidi) {
+                    bassMidi = noteMidiScratch[index]
+                }
+            }
         }
 
-        return PitchProfile(chroma = chroma, bassPitchClass = bass)
+        return PitchProfile(
+            chroma = chromaScratch,
+            bassPitchClass = if (bassMidi == Int.MAX_VALUE) -1 else floorMod12(bassMidi),
+        )
     }
 
     private fun fundamentalSalience(
@@ -222,25 +240,6 @@ internal class ChordDetector(
             if (magnitudes[bin] > peak) peak = magnitudes[bin]
         }
         return ln(1.0 + peak)
-    }
-
-    private fun smooth(current: DoubleArray): DoubleArray {
-        chromaHistory.addLast(current)
-        if (chromaHistory.size > chromaWindow) chromaHistory.removeFirst()
-
-        val result = DoubleArray(12)
-        var totalWeight = 0.0
-        chromaHistory.forEachIndexed { index, frame ->
-            val weight = (index + 1).toDouble()
-            totalWeight += weight
-            for (pitchClass in result.indices) {
-                result[pitchClass] += frame[pitchClass] * weight
-            }
-        }
-        if (totalWeight > 0.0) {
-            for (i in result.indices) result[i] /= totalWeight
-        }
-        return result
     }
 
     private fun scoreTemplate(
