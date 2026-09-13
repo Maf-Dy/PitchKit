@@ -92,9 +92,7 @@ class CremaStreamingRecognizer(
         }
         val emitted = stabilizer.update(rawRecognition)
         logDecision(
-            rawLabel = prediction?.label,
-            rawModelLabel = prediction?.rawLabel,
-            rawConfidence = prediction?.confidence,
+            prediction = prediction,
             emitted = emitted,
         )
         return emitted
@@ -125,17 +123,20 @@ class CremaStreamingRecognizer(
     }
 
     private fun logDecision(
-        rawLabel: String?,
-        rawModelLabel: String?,
-        rawConfidence: Double?,
+        prediction: CremaDecodedChord?,
         emitted: ChordRecognition?,
     ) {
         if (!BuildConfig.DEBUG) return
+        val top = prediction?.alternatives
+            ?.joinToString(separator = " | ") { candidate ->
+                "${candidate.label}=fit:${"%.3f".format(candidate.fit)},tag:${"%.3f".format(candidate.tagConfidence)}"
+            }
+            .orEmpty()
         Log.d(
             "PitchKitChord",
-            "backend=Crema raw=${rawLabel ?: "N"} model=${rawModelLabel ?: "N"} " +
-                "conf=${rawConfidence?.let { "%.3f".format(it) } ?: "-"} " +
-                "emitted=${emitted?.label ?: "-"}",
+            "backend=Crema raw=${prediction?.label ?: "N"} model=${prediction?.rawLabel ?: "N"} " +
+                "conf=${prediction?.confidence?.let { "%.3f".format(it) } ?: "-"} " +
+                "top3=[$top] emitted=${emitted?.label ?: "-"}",
         )
     }
 
