@@ -19,6 +19,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.app.ActivityCompat
@@ -60,6 +61,7 @@ fun GuitarTunerListener(
     val context = LocalContext.current
     val applicationContext = context.applicationContext
     val activity = context as? Activity
+    val currentOnResult by rememberUpdatedState(onResult)
 
     var granted by remember {
         mutableStateOf(
@@ -244,7 +246,7 @@ fun GuitarTunerListener(
             lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 engine.start().collect { result ->
                     if (BuildConfig.DEBUG) Log.d("PitchKit", result.toString())
-                    onResult(result)
+                    currentOnResult(result)
                 }
             }
         }
