@@ -1,19 +1,26 @@
 package com.nicos.pitchkit.tuner.harmony.lvchordia
 
-import android.os.SystemClock
-import android.util.Log
-import com.nicos.pitchkit.BuildConfig
-import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
 import com.nicos.pitchkit.tuner.harmony.chordnet.StreamingPcmResampler
 import com.nicos.pitchkit.tuner.harmony.song.SongChordSegment
 import com.nicos.pitchkit.tuner.harmony.song.SongHarmonyAnalysis
 import com.nicos.pitchkit.tuner.harmony.song.SongSection
 import com.nicos.pitchkit.tuner.harmony.song.SongSectionDetector
-import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
 
-/** Offline LV Song large-vocabulary analyzer using the ensemble + dictionary HMM as authority. */
+/**
+ * Offline LV Song large-vocabulary analyzer.
+ *
+ * Upstream LV-Chordia runs a bidirectional LSTM over the song CQT before the
+ * dictionary HMM. Running tiny independent windows is therefore not equivalent:
+ * frames near each artificial window boundary lose most of their future/past
+ * context and ambiguous chord changes can be reported late.
+ *
+ * Android cannot safely run an arbitrarily long full-song BiLSTM in one ONNX
+ * call, so we use overlap-protected windows. Only the well-contextualized center
+ * of each internal window is committed. Ensemble members are evaluated
+ * sequentially to keep peak activation memory bounded.
+ */
 class LvChordiaSongAnalyzer internal constructor(
     modelBytes: List<ByteArray>,
     dictionaryJson: String,
@@ -23,24 +30,17 @@ class LvChordiaSongAnalyzer internal constructor(
     preferFlats: Boolean = false,
 ) : AutoCloseable {
     private companion object {
-        const val MODEL_WINDOW_FRAMES = 512
-        const val MODEL_OVERLAP_FRAMES = 64
+        // 1024 frames = ~23.8 s at 22.05 kHz / 512 hop.
+        // 384-frame overlap leaves ~4.46 s of protected context on each side
+        // of an internal commit boundary, versus ~0.74 s in the old port.
+        const val MODEL_WINDOW_FRAMES = 1024
+        const val MODEL_OVERLAP_FRAMES = 384
         const val MODEL_HALF_OVERLAP = MODEL_OVERLAP_FRAMES / 2
         const val MODEL_STEP_FRAMES = MODEL_WINDOW_FRAMES - MODEL_OVERLAP_FRAMES
-        const val HARMONY_PRESENCE_THRESHOLD = 0.28f
-        const val HARMONY_MEAN_WEIGHT = 0.65
-        const val HARMONY_PERSISTENCE_WEIGHT = 0.35
     }
-
-    private data class DiagnosticSegment(
-        val start: Int,
-        val endExclusive: Int,
-        val label: String?,
-    )
 
     private val frontend = LvChordiaHybridCqtFrontend(lowPlanBytes, highPlanBytes)
     private val runners = modelBytes.map(::LvChordiaOnnxRunner)
-    private val inferencePool = Executors.newFixedThreadPool(minOf(3, runners.size))
     private val dictionary = LvChordiaDictionaryParser.parse(dictionaryJson, preferFlats)
     private val sequenceDecoder = LvChordiaDictionaryDecoder(dictionary)
     private val resampler = StreamingPcmResampler(
@@ -59,8 +59,11 @@ class LvChordiaSongAnalyzer internal constructor(
             "Songs mode requires all ${LvChordiaContract.MODEL_FILES.size} LV Song ensemble members"
         }
         require(referenceA4Hz in 300.0..600.0)
+        require(MODEL_OVERLAP_FRAMES < MODEL_WINDOW_FRAMES)
+        require(MODEL_HALF_OVERLAP * 2 == MODEL_OVERLAP_FRAMES)
     }
 
+    /** Feed decoded mono PCM values in the -1..1 range. */
     @Synchronized
     fun accept(samples: FloatArray, sampleRate: Int) {
         check(!closed) { "LvChordiaSongAnalyzer is closed" }
@@ -86,9 +89,7 @@ class LvChordiaSongAnalyzer internal constructor(
             return emptyAnalysis(finalDuration).also { cachedResult = it }
         }
 
-        val startedAt = SystemClock.elapsedRealtimeNanos()
         val features = frontend.transform(pcm.toFloatArray())
-        val cqtDoneAt = SystemClock.elapsedRealtimeNanos()
         pcm.clear()
         if (features.frameCount <= 0) {
             return emptyAnalysis(finalDuration).also { cachedResult = it }
@@ -97,7 +98,6 @@ class LvChordiaSongAnalyzer internal constructor(
         val committed = HeadsAccumulator()
         val frameNumbers = LongAccumulator(initialCapacity = features.frameCount)
         analyzeFeatureWindows(features, committed, frameNumbers)
-        val ensembleDoneAt = SystemClock.elapsedRealtimeNanos()
 
         val heads = committed.build()
         if (heads.frames <= 0) {
@@ -106,33 +106,17 @@ class LvChordiaSongAnalyzer internal constructor(
         val frames = frameNumbers.toLongArray()
         require(frames.size == heads.frames)
 
-        val modelDecoded = sequenceDecoder.decode(heads)
-        val hmmDoneAt = SystemClock.elapsedRealtimeNanos()
-        require(modelDecoded.size == frames.size)
-        logHarmonyDiagnostics(modelDecoded, frames, heads)
-
-        // Upstream LV-Chordia's full-song path is model ensemble -> dictionary
-        // HMM -> chord segments. Do not silently rewrite that decoded sequence
-        // from a second handcrafted chroma scorer; doing so can turn a correct,
-        // low-confidence model result into a confident but different chord.
-        val decoded = modelDecoded
+        // Keep the upstream authority chain intact:
+        // CQT -> 5-model probability average -> full dictionary HMM -> segments.
+        val decoded = sequenceDecoder.decode(heads)
+        require(decoded.size == frames.size)
 
         val chords = buildChordSegments(decoded, frames, finalDuration)
-        val result = SongHarmonyAnalysis(
+        return SongHarmonyAnalysis(
             durationMs = finalDuration,
             chords = chords,
             sections = SongSectionDetector.detect(chords, finalDuration),
-        )
-        logTiming(
-            startedAt = startedAt,
-            cqtDoneAt = cqtDoneAt,
-            ensembleDoneAt = ensembleDoneAt,
-            hmmDoneAt = hmmDoneAt,
-            frames = features.frameCount,
-            chordCount = chords.size,
-        )
-        cachedResult = result
-        return result
+        ).also { cachedResult = it }
     }
 
     private fun analyzeFeatureWindows(
@@ -151,12 +135,13 @@ class LvChordiaSongAnalyzer internal constructor(
                 endIndex = endFrame * LvChordiaContract.INPUT_BINS,
             )
 
-            val futures = runners.map { runner ->
-                inferencePool.submit<LvChordiaHeads> {
-                    runner.infer(windowValues, frameCount)
-                }
-            }
-            val average = LvChordiaHeads.average(futures.map { it.get() })
+            // Do not run several large BiLSTM/CNN graphs concurrently. The
+            // upstream ensemble average is mathematically identical whether
+            // members are evaluated concurrently or sequentially, while the
+            // latter has a much safer Android peak-memory profile.
+            val average = LvChordiaHeads.average(
+                runners.map { runner -> runner.infer(windowValues, frameCount) }
+            )
 
             val isFirst = startFrame == 0
             val isLast = endFrame == features.frameCount
@@ -185,168 +170,6 @@ class LvChordiaSongAnalyzer internal constructor(
         sections = if (durationMs > 0L) listOf(SongSection("A", 0L, durationMs)) else emptyList(),
     )
 
-    /**
-     * Retained for diagnostics/experiments, but deliberately not part of the
-     * production LV Song path. The HMM/dictionary result above is authoritative.
-     */
-    private fun rerankExtensionsWithPitchEvidence(
-        decoded: List<LvChordiaDecodedFrame>,
-        frames: LongArray,
-        harmonyChroma: FloatArray,
-        bassChroma: FloatArray,
-        chromaFrameCount: Int,
-    ): List<LvChordiaDecodedFrame> {
-        if (
-            decoded.isEmpty() ||
-            chromaFrameCount <= 0 ||
-            harmonyChroma.size < chromaFrameCount * 12 ||
-            bassChroma.size < chromaFrameCount * 12
-        ) {
-            return decoded
-        }
-
-        val result = decoded.toMutableList()
-        var start = 0
-        while (start < decoded.size) {
-            val label = decoded[start].label
-            var end = start + 1
-            while (end < decoded.size && decoded[end].label == label) end++
-
-            if (label != null) {
-                val firstSourceFrame = frames[start]
-                    .coerceIn(0L, (chromaFrameCount - 1).toLong())
-                    .toInt()
-                val lastSourceFrame = frames[end - 1]
-                    .coerceIn(firstSourceFrame.toLong(), (chromaFrameCount - 1).toLong())
-                    .toInt()
-                val frameRange = firstSourceFrame..lastSourceFrame
-                val harmonyEvidence = persistentHarmonyEvidence(
-                    chroma = harmonyChroma,
-                    frameCount = chromaFrameCount,
-                    frameIndices = frameRange,
-                )
-                val bassEvidence = PitchClassChordReranker.averageEvidence(
-                    chroma = bassChroma,
-                    frameCount = chromaFrameCount,
-                    frameIndices = frameRange,
-                )
-
-                val reranked = PitchClassChordReranker.rerank(label, harmonyEvidence)
-                val rootResolved = PitchClassChordReranker.resolveEquivalentRoot(
-                    label = reranked.label,
-                    pitchEvidence = harmonyEvidence,
-                    bassEvidence = bassEvidence,
-                )
-                val chosen = if (rootResolved.changed) rootResolved else reranked
-
-                if (chosen.changed) {
-                    for (index in start until end) {
-                        result[index] = decoded[index].copy(label = chosen.label)
-                    }
-                    if (BuildConfig.DEBUG) {
-                        Log.d(
-                            "PitchKitHarmony",
-                            "LV Song correction $label -> ${chosen.label} " +
-                                "frames=$firstSourceFrame-$lastSourceFrame " +
-                                "score=${"%.3f".format(chosen.originalScore)}->${"%.3f".format(chosen.score)} " +
-                                "harmony=[${pitchSummary(harmonyEvidence)}] " +
-                                "bass=[${pitchSummary(bassEvidence)}]",
-                        )
-                    }
-                }
-            }
-            start = end
-        }
-        return result
-    }
-
-    private fun persistentHarmonyEvidence(
-        chroma: FloatArray,
-        frameCount: Int,
-        frameIndices: IntRange,
-    ): FloatArray {
-        if (frameCount <= 0 || chroma.size < frameCount * 12) return FloatArray(12)
-        val first = frameIndices.first.coerceIn(0, frameCount - 1)
-        val last = frameIndices.last.coerceIn(first, frameCount - 1)
-        val count = last - first + 1
-        if (count <= 3) {
-            return PitchClassChordReranker.averageEvidence(chroma, frameCount, first..last)
-        }
-
-        val mean = DoubleArray(12)
-        val present = IntArray(12)
-        for (frame in first..last) {
-            val offset = frame * 12
-            for (pc in 0 until 12) {
-                val value = chroma[offset + pc].coerceIn(0f, 1f)
-                mean[pc] += value
-                if (value >= HARMONY_PRESENCE_THRESHOLD) present[pc]++
-            }
-        }
-
-        val combined = DoubleArray(12)
-        for (pc in 0 until 12) {
-            val average = mean[pc] / count.toDouble()
-            val persistence = present[pc].toDouble() / count.toDouble()
-            combined[pc] = HARMONY_MEAN_WEIGHT * average +
-                HARMONY_PERSISTENCE_WEIGHT * persistence
-        }
-
-        val peak = combined.maxOrNull()?.coerceAtLeast(0.0) ?: 0.0
-        if (peak <= 1e-12) return FloatArray(12)
-        return FloatArray(12) { pc -> (combined[pc] / peak).coerceIn(0.0, 1.0).toFloat() }
-    }
-
-    private fun pitchSummary(evidence: FloatArray): String {
-        val names = arrayOf("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
-        return evidence.indices
-            .sortedByDescending { evidence[it] }
-            .take(6)
-            .joinToString(",") { index -> "${names[index]}=${"%.2f".format(evidence[index])}" }
-    }
-
-    private fun logHarmonyDiagnostics(
-        decoded: List<LvChordiaDecodedFrame>,
-        frames: LongArray,
-        heads: LvChordiaHeads,
-    ) {
-        if (!BuildConfig.DEBUG || decoded.isEmpty()) return
-
-        val segments = mutableListOf<DiagnosticSegment>()
-        var start = 0
-        while (start < decoded.size) {
-            val label = decoded[start].label
-            var end = start + 1
-            while (end < decoded.size && decoded[end].label == label) end++
-            segments += DiagnosticSegment(start, end, label)
-            start = end
-        }
-
-        val midpoints = IntArray(segments.size) { index ->
-            val segment = segments[index]
-            (segment.start + segment.endExclusive - 1) / 2
-        }
-        val diagnostics = sequenceDecoder
-            .diagnoseFrames(heads, midpoints, limit = 3)
-            .associateBy { it.frame }
-
-        for ((index, segment) in segments.withIndex()) {
-            val midpoint = midpoints[index]
-            val diagnostic = diagnostics[midpoint] ?: continue
-            val rawTop = diagnostic.topCandidates.joinToString(separator = " | ") { candidate ->
-                "${candidate.displayLabel ?: candidate.rawLabel}=${"%.3f".format(candidate.confidence)}"
-            }
-            val startMs = frameToMs(frames[segment.start])
-            val endFrameIndex = (segment.endExclusive - 1).coerceAtMost(frames.lastIndex)
-            val endMs = frameToMs(frames[endFrameIndex])
-            Log.d(
-                "PitchKitHarmony",
-                "LV Song ${startMs}-${endMs}ms hmm=${segment.label ?: "N"} " +
-                    "rawTop=[$rawTop] ${diagnostic.headSummary}",
-            )
-        }
-    }
-
     private fun buildChordSegments(
         decoded: List<LvChordiaDecodedFrame>,
         frames: LongArray,
@@ -371,7 +194,9 @@ class LvChordiaSongAnalyzer internal constructor(
                         label = label,
                         startMs = startMs,
                         endMs = endMs,
-                        confidence = decoded.subList(start, end).map { it.confidence }.averageOrZero(),
+                        confidence = decoded.subList(start, end)
+                            .map { it.confidence }
+                            .averageOrZero(),
                     )
                 }
             }
@@ -406,32 +231,10 @@ class LvChordiaSongAnalyzer internal constructor(
     private fun frameToMs(frame: Long): Long =
         frame * LvChordiaContract.HOP_LENGTH * 1000L / LvChordiaContract.SAMPLE_RATE
 
-    private fun logTiming(
-        startedAt: Long,
-        cqtDoneAt: Long,
-        ensembleDoneAt: Long,
-        hmmDoneAt: Long,
-        frames: Int,
-        chordCount: Int,
-    ) {
-        if (!BuildConfig.DEBUG) return
-        val cqtMs = (cqtDoneAt - startedAt) / 1_000_000.0
-        val ensembleMs = (ensembleDoneAt - cqtDoneAt) / 1_000_000.0
-        val hmmMs = (hmmDoneAt - ensembleDoneAt) / 1_000_000.0
-        val totalMs = (hmmDoneAt - startedAt) / 1_000_000.0
-        Log.d(
-            "PitchKitPerf",
-            "LV Song frames=$frames chords=$chordCount cqt=${"%.1f".format(cqtMs)}ms " +
-                "ensemble=${"%.1f".format(ensembleMs)}ms hmm=${"%.1f".format(hmmMs)}ms " +
-                "total=${"%.1f".format(totalMs)}ms",
-        )
-    }
-
     @Synchronized
     override fun close() {
         if (closed) return
         closed = true
-        inferencePool.shutdownNow()
         runners.forEach { runCatching { it.close() } }
         pcm.clear()
     }
