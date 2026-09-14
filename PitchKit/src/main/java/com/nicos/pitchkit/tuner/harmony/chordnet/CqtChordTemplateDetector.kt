@@ -5,10 +5,10 @@ import kotlin.math.max
 /**
  * Direct pitch-class fallback for live recognition.
  *
- * ChordNet remains the primary recognizer. This detector is intentionally
- * conservative and is only used when its pitch-set evidence is strong enough
- * to rescue a low-confidence/no-chord neural result. Bass evidence breaks the
- * m6 <-> hdim7 equivalence and the four-way symmetry of dim7.
+ * The neural recognizer remains primary. This detector is only allowed to
+ * override it when the observed pitch set strongly supports a chord spelling
+ * which the 170-class model cannot represent directly (9ths, altered dominant
+ * colors, 11ths/13ths, etc.) or resolves a known ambiguous quality.
  */
 internal object CqtChordTemplateDetector {
     data class Result(
@@ -19,8 +19,10 @@ internal object CqtChordTemplateDetector {
 
     private data class Quality(
         val suffix: String,
-        val intervals: IntArray,
-        val minimumExtensionSupport: Float = 0.18f,
+        val required: IntArray,
+        val optional: IntArray = intArrayOf(),
+        val minimumColorSupport: Float = 0.18f,
+        val rescue: Boolean = false,
     )
 
     private val sharpNames = arrayOf(
@@ -34,15 +36,28 @@ internal object CqtChordTemplateDetector {
         Quality("maj7", intArrayOf(0, 4, 7, 11)),
         Quality("m7", intArrayOf(0, 3, 7, 10)),
         Quality("6", intArrayOf(0, 4, 7, 9)),
-        Quality("m6", intArrayOf(0, 3, 7, 9)),
+        Quality("m6", intArrayOf(0, 3, 7, 9), rescue = true),
         Quality("dim", intArrayOf(0, 3, 6)),
-        Quality("dim7", intArrayOf(0, 3, 6, 9)),
-        Quality("ø7", intArrayOf(0, 3, 6, 10)),
+        Quality("dim7", intArrayOf(0, 3, 6, 9), rescue = true),
+        Quality("ø7", intArrayOf(0, 3, 6, 10), rescue = true),
         Quality("sus2", intArrayOf(0, 2, 7)),
         Quality("sus4", intArrayOf(0, 5, 7)),
-        Quality("6/9", intArrayOf(0, 2, 4, 7, 9), minimumExtensionSupport = 0.20f),
-        Quality("9", intArrayOf(0, 2, 4, 7, 10), minimumExtensionSupport = 0.20f),
-        Quality("m9", intArrayOf(0, 2, 3, 7, 10), minimumExtensionSupport = 0.20f),
+
+        // The fifth is optional in the extended voicings below. Requiring the
+        // harmonic identity tones (3rd/7th/color) matches normal piano/guitar
+        // practice better than demanding every textbook chord tone.
+        Quality("6/9", intArrayOf(0, 4, 9, 2), optional = intArrayOf(7), minimumColorSupport = 0.20f, rescue = true),
+        Quality("9", intArrayOf(0, 4, 10, 2), optional = intArrayOf(7), minimumColorSupport = 0.20f, rescue = true),
+        Quality("maj9", intArrayOf(0, 4, 11, 2), optional = intArrayOf(7), minimumColorSupport = 0.20f, rescue = true),
+        Quality("m9", intArrayOf(0, 3, 10, 2), optional = intArrayOf(7), minimumColorSupport = 0.20f, rescue = true),
+        Quality("7♭9", intArrayOf(0, 4, 10, 1), optional = intArrayOf(7), minimumColorSupport = 0.22f, rescue = true),
+        Quality("7♯9", intArrayOf(0, 4, 10, 3), optional = intArrayOf(7), minimumColorSupport = 0.22f, rescue = true),
+        Quality("7♯11", intArrayOf(0, 4, 10, 6), optional = intArrayOf(2, 7), minimumColorSupport = 0.22f, rescue = true),
+        Quality("7♭13", intArrayOf(0, 4, 10, 8), optional = intArrayOf(2, 7), minimumColorSupport = 0.22f, rescue = true),
+        Quality("m11", intArrayOf(0, 3, 10, 5), optional = intArrayOf(2, 7), minimumColorSupport = 0.22f, rescue = true),
+        Quality("13", intArrayOf(0, 4, 10, 9), optional = intArrayOf(2, 7), minimumColorSupport = 0.22f, rescue = true),
+        Quality("maj13", intArrayOf(0, 4, 11, 9), optional = intArrayOf(2, 7), minimumColorSupport = 0.22f, rescue = true),
+        Quality("m13", intArrayOf(0, 3, 10, 9), optional = intArrayOf(2, 7), minimumColorSupport = 0.22f, rescue = true),
     )
 
     fun detect(pitchEvidence: FloatArray, bassEvidence: FloatArray): Result? {
@@ -77,17 +92,19 @@ internal object CqtChordTemplateDetector {
         return Result(label = label, score = bestScore, margin = margin)
     }
 
+    fun isRescueCandidate(label: String): Boolean = qualities.any { quality ->
+        quality.rescue && label.endsWith(quality.suffix)
+    }
+
     private fun supported(root: Int, quality: Quality, pitch: FloatArray): Boolean {
-        val values = quality.intervals.map { interval -> pitch[(root + interval) % 12] }
+        val values = quality.required.map { interval -> pitch[(root + interval) % 12] }
         if (values.any { it < 0.14f }) return false
 
-        // Added tones must be real, not weak spectral leakage. The first three
-        // intervals form the basic triad for every quality in this table except
-        // sus/dim, where this remains harmless because there are no extensions.
-        if (quality.intervals.size > 3) {
-            for (index in 3 until quality.intervals.size) {
-                if (values[index] < quality.minimumExtensionSupport) return false
-            }
+        // For complex qualities, the final required tone is the defining color
+        // tone (9/b9/#9/#11/11/13/b13). It must be more than leakage.
+        if (quality.rescue && quality.required.size >= 4) {
+            val color = values.last()
+            if (color < quality.minimumColorSupport) return false
         }
         return true
     }
@@ -98,28 +115,36 @@ internal object CqtChordTemplateDetector {
         pitch: FloatArray,
         bass: FloatArray,
     ): Double {
-        val requiredPcs = quality.intervals.map { (root + it) % 12 }
+        val requiredPcs = quality.required.map { (root + it) % 12 }
+        val optionalPcs = quality.optional.map { (root + it) % 12 }
         val required = requiredPcs.map { pitch[it].toDouble() }
         val mean = required.average()
         val weakest = required.minOrNull() ?: 0.0
-        val requiredSet = requiredPcs.toSet()
+        val expectedSet = (requiredPcs + optionalPcs).toSet()
 
         var strongestOutside = 0.0
         for (pc in 0 until 12) {
-            if (pc !in requiredSet) strongestOutside = max(strongestOutside, pitch[pc].toDouble())
+            if (pc !in expectedSet) strongestOutside = max(strongestOutside, pitch[pc].toDouble())
+        }
+
+        val optionalSupport = if (optionalPcs.isEmpty()) {
+            0.0
+        } else {
+            optionalPcs.map { pitch[it].toDouble() }.average()
         }
 
         var strongestChordToneBass = 0.0
-        for (pc in requiredPcs) strongestChordToneBass = max(strongestChordToneBass, bass[pc].toDouble())
+        for (pc in expectedSet) strongestChordToneBass = max(strongestChordToneBass, bass[pc].toDouble())
         val rootBass = bass[root].toDouble()
 
-        val extensions = (quality.intervals.size - 3).coerceAtLeast(0)
+        val complexity = (quality.required.size + quality.optional.size - 3).coerceAtLeast(0)
         return 0.52 * mean +
-            0.27 * weakest -
-            0.15 * strongestOutside +
+            0.27 * weakest +
+            0.05 * optionalSupport -
+            0.17 * strongestOutside +
             0.18 * rootBass +
             0.03 * strongestChordToneBass -
-            0.010 * extensions
+            0.008 * complexity
     }
 
     private fun normalize(values: FloatArray): FloatArray {
