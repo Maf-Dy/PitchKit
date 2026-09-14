@@ -98,6 +98,7 @@ class ChordNetStreamingRecognizer(
             windowCount = 1,
             validFrameCount = validFrames,
             smoothingKernel = LIVE_SMOOTHING_KERNEL,
+            includeAlternatives = BuildConfig.DEBUG,
         )
 
         val prediction = predictions[validFrames - 1]
