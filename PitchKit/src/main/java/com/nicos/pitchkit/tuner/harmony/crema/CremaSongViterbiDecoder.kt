@@ -1,8 +1,10 @@
 package com.nicos.pitchkit.tuner.harmony.crema
 
+import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.max
 
-/** Whole-song Viterbi decoder for Crema's chord-tag output. */
+/** Whole-song Viterbi decoder fusing Crema tag, root and pitch-content heads. */
 internal class CremaSongViterbiDecoder(
     private val state: CremaRuntimeState,
     private val preferFlats: Boolean,
@@ -10,6 +12,8 @@ internal class CremaSongViterbiDecoder(
     private data class Observation(
         val frame: Long,
         val tag: FloatArray,
+        val pitch: FloatArray,
+        val root: FloatArray,
         val bass: FloatArray,
     )
 
@@ -17,6 +21,9 @@ internal class CremaSongViterbiDecoder(
         val frame: Long,
         val label: String?,
         val confidence: Double,
+        val root: String? = null,
+        val bass: String? = null,
+        val pitchClasses: List<String> = emptyList(),
     )
 
     private val observations = mutableListOf<Observation>()
@@ -26,6 +33,8 @@ internal class CremaSongViterbiDecoder(
         observations += Observation(
             frame = globalFrame,
             tag = heads.tag.copyRow(localFrame, CremaContract.CHORD_COUNT),
+            pitch = heads.pitch.copyRow(localFrame, CremaContract.PITCH_COUNT),
+            root = heads.root.copyRow(localFrame, CremaContract.ROOT_COUNT),
             bass = heads.bass.copyRow(localFrame, CremaContract.BASS_COUNT),
         )
     }
@@ -40,7 +49,7 @@ internal class CremaSongViterbiDecoder(
         val uniformPrior = -ln(classCount.toDouble())
 
         var previous = DoubleArray(classCount) { stateIndex ->
-            uniformPrior + logEmission(observations[0].tag[stateIndex])
+            uniformPrior + observationLog(observations[0], stateIndex)
         }
         val backPointers = Array(timeCount) { IntArray(classCount) { -1 } }
 
@@ -63,7 +72,6 @@ internal class CremaSongViterbiDecoder(
             }
 
             val current = DoubleArray(classCount)
-            val emissions = observations[time].tag
             for (stateIndex in 0 until classCount) {
                 val stayScore = previous[stateIndex] + logStay
                 val switchFrom = if (bestIndex != stateIndex) bestIndex else secondIndex
@@ -71,10 +79,10 @@ internal class CremaSongViterbiDecoder(
                 val switchScore = switchBase + logSwitch
 
                 if (stayScore >= switchScore || switchFrom < 0) {
-                    current[stateIndex] = stayScore + logEmission(emissions[stateIndex])
+                    current[stateIndex] = stayScore + observationLog(observations[time], stateIndex)
                     backPointers[time][stateIndex] = stateIndex
                 } else {
-                    current[stateIndex] = switchScore + logEmission(emissions[stateIndex])
+                    current[stateIndex] = switchScore + observationLog(observations[time], stateIndex)
                     backPointers[time][stateIndex] = switchFrom
                 }
             }
@@ -90,36 +98,78 @@ internal class CremaSongViterbiDecoder(
 
         return List(timeCount) { time ->
             val stateIndex = path[time]
+            val observation = observations[time]
+            val raw = state.labels[stateIndex]
+            val parsed = parse(raw)
+            val rootPc = parsed?.first
+            val bassPc = rootPc?.let { chosenBass(it, parsed.second, observation.bass) }
             Prediction(
-                frame = observations[time].frame,
-                label = displayLabel(state.labels[stateIndex], observations[time].bass),
-                confidence = observations[time].tag[stateIndex].toDouble().coerceIn(0.0, 1.0),
+                frame = observation.frame,
+                label = displayLabel(raw, observation.bass),
+                confidence = exp(observationLog(observation, stateIndex)).coerceIn(0.0, 1.0),
+                root = rootPc?.let(::noteName),
+                bass = bassPc?.let(::noteName),
+                pitchClasses = observation.pitch.indices
+                    .take(12)
+                    .filter { observation.pitch[it] >= 0.50f }
+                    .map(::noteName),
             )
         }
     }
 
-    private fun displayLabel(raw: String, bass: FloatArray): String? {
+    private fun observationLog(observation: Observation, stateIndex: Int): Double {
+        val tagProbability = observation.tag[stateIndex].toDouble().coerceIn(EPSILON, 1.0)
+        val parsed = parse(state.labels[stateIndex])
+            ?: return ln(tagProbability)
+        val (rootPc, quality) = parsed
+        val intervals = QUALITY_INTERVALS[quality] ?: return ln(tagProbability)
+        val rootProbability = observation.root[rootPc].toDouble().coerceIn(EPSILON, 1.0)
+        val required = intervals.map { observation.pitch[(rootPc + it) % 12].toDouble() }
+        val meanRequired = required.average().coerceIn(EPSILON, 1.0)
+        val tones = intervals.map { (rootPc + it) % 12 }.toSet()
+        val strongestOutside = observation.pitch.indices
+            .take(12)
+            .filter { it !in tones }
+            .maxOfOrNull { observation.pitch[it].toDouble() }
+            ?.coerceIn(0.0, 1.0)
+            ?: 0.0
+        val pitchFit = (0.80 * meanRequired + 0.20 * (1.0 - strongestOutside))
+            .coerceIn(EPSILON, 1.0)
+
+        return 0.70 * ln(tagProbability) +
+            0.15 * ln(rootProbability) +
+            0.15 * ln(pitchFit)
+    }
+
+    private fun parse(raw: String): Pair<Int, String>? {
         if (raw == "N" || raw == "X") return null
         val separator = raw.indexOf(':')
         if (separator <= 0) return null
-        val rootText = raw.substring(0, separator)
+        val rootPc = SHARP_NOTES.indexOf(raw.substring(0, separator))
         val quality = raw.substring(separator + 1)
-        val rootPc = SHARP_NOTES.indexOf(rootText)
-        val chordTones = QUALITY_INTERVALS[quality] ?: return null
-        if (rootPc < 0) return null
+        if (rootPc < 0 || quality !in QUALITY_INTERVALS) return null
+        return rootPc to quality
+    }
 
-        val bassPc = (0 until minOf(12, bass.size)).maxByOrNull { bass[it] } ?: rootPc
-        val relativeBass = (bassPc - rootPc + 12) % 12
-        val validInversion = relativeBass != 0 && chordTones.contains(relativeBass)
-
+    private fun displayLabel(raw: String, bass: FloatArray): String? {
+        val parsed = parse(raw) ?: return null
+        val (rootPc, quality) = parsed
+        val bassPc = chosenBass(rootPc, quality, bass)
         return buildString {
             append(noteName(rootPc))
             append(displayQuality(quality))
-            if (validInversion) {
+            if (bassPc != null && bassPc != rootPc) {
                 append('/')
                 append(noteName(bassPc))
             }
         }
+    }
+
+    private fun chosenBass(rootPc: Int, quality: String, bass: FloatArray): Int? {
+        val chordTones = QUALITY_INTERVALS[quality] ?: return rootPc
+        val bassPc = (0 until minOf(12, bass.size)).maxByOrNull { bass[it] } ?: rootPc
+        val relativeBass = (bassPc - rootPc + 12) % 12
+        return if (relativeBass == 0 || chordTones.contains(relativeBass)) bassPc else rootPc
     }
 
     private fun noteName(pitchClass: Int): String =
@@ -142,8 +192,6 @@ internal class CremaSongViterbiDecoder(
         "sus4" -> "sus4"
         else -> ":$quality"
     }
-
-    private fun logEmission(value: Float): Double = ln(value.toDouble().coerceIn(EPSILON, 1.0))
 
     private fun FloatArray.copyRow(row: Int, width: Int): FloatArray {
         val offset = row * width
