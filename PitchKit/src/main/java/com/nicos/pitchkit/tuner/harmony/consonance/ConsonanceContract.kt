@@ -10,6 +10,8 @@ object ConsonanceContract {
     const val PITCH_COUNT = 12
 
     const val CHUNK_SECONDS = 20
+    // Fixed 20-second centered CQT length used by upstream inference and ONNX export.
+    const val SEQUENCE_FRAMES = 862
     const val PITCH_THRESHOLD = 0.50f
     const val MIN_SEGMENT_SECONDS = 0.50
 
