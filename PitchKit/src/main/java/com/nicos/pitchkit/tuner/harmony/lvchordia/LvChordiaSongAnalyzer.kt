@@ -13,7 +13,7 @@ import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
 
-/** Offline LV-Chordia large-vocabulary song analyzer kept for comparison. */
+/** Offline LV Song large-vocabulary analyzer with register-aware pitch refinement. */
 class LvChordiaSongAnalyzer internal constructor(
     modelBytes: List<ByteArray>,
     dictionaryJson: String,
@@ -53,7 +53,7 @@ class LvChordiaSongAnalyzer internal constructor(
 
     init {
         require(modelBytes.size == LvChordiaContract.MODEL_FILES.size) {
-            "Songs mode requires all ${LvChordiaContract.MODEL_FILES.size} LV-Chordia ensemble members"
+            "Songs mode requires all ${LvChordiaContract.MODEL_FILES.size} LV Song ensemble members"
         }
         require(referenceA4Hz in 300.0..600.0)
     }
@@ -111,7 +111,8 @@ class LvChordiaSongAnalyzer internal constructor(
         val decoded = rerankExtensionsWithPitchEvidence(
             decoded = modelDecoded,
             frames = frames,
-            chroma = features.chroma,
+            harmonyChroma = features.harmonyChroma,
+            bassChroma = features.bassChroma,
             chromaFrameCount = features.frameCount,
         )
 
@@ -186,10 +187,16 @@ class LvChordiaSongAnalyzer internal constructor(
     private fun rerankExtensionsWithPitchEvidence(
         decoded: List<LvChordiaDecodedFrame>,
         frames: LongArray,
-        chroma: FloatArray,
+        harmonyChroma: FloatArray,
+        bassChroma: FloatArray,
         chromaFrameCount: Int,
     ): List<LvChordiaDecodedFrame> {
-        if (decoded.isEmpty() || chromaFrameCount <= 0 || chroma.size < chromaFrameCount * 12) {
+        if (
+            decoded.isEmpty() ||
+            chromaFrameCount <= 0 ||
+            harmonyChroma.size < chromaFrameCount * 12 ||
+            bassChroma.size < chromaFrameCount * 12
+        ) {
             return decoded
         }
 
@@ -207,23 +214,38 @@ class LvChordiaSongAnalyzer internal constructor(
                 val lastSourceFrame = frames[end - 1]
                     .coerceIn(firstSourceFrame.toLong(), (chromaFrameCount - 1).toLong())
                     .toInt()
-                val evidence = PitchClassChordReranker.averageEvidence(
-                    chroma = chroma,
+                val frameRange = firstSourceFrame..lastSourceFrame
+                val harmonyEvidence = PitchClassChordReranker.averageEvidence(
+                    chroma = harmonyChroma,
                     frameCount = chromaFrameCount,
-                    frameIndices = firstSourceFrame..lastSourceFrame,
+                    frameIndices = frameRange,
                 )
-                val reranked = PitchClassChordReranker.rerank(label, evidence)
-                if (reranked.changed) {
+                val bassEvidence = PitchClassChordReranker.averageEvidence(
+                    chroma = bassChroma,
+                    frameCount = chromaFrameCount,
+                    frameIndices = frameRange,
+                )
+
+                val reranked = PitchClassChordReranker.rerank(label, harmonyEvidence)
+                val rootResolved = PitchClassChordReranker.resolveEquivalentRoot(
+                    label = reranked.label,
+                    pitchEvidence = harmonyEvidence,
+                    bassEvidence = bassEvidence,
+                )
+                val chosen = if (rootResolved.changed) rootResolved else reranked
+
+                if (chosen.changed) {
                     for (index in start until end) {
-                        result[index] = decoded[index].copy(label = reranked.label)
+                        result[index] = decoded[index].copy(label = chosen.label)
                     }
                     if (BuildConfig.DEBUG) {
                         Log.d(
                             "PitchKitHarmony",
-                            "LV correction $label -> ${reranked.label} " +
+                            "LV Song correction $label -> ${chosen.label} " +
                                 "frames=$firstSourceFrame-$lastSourceFrame " +
-                                "score=${"%.3f".format(reranked.originalScore)}->${"%.3f".format(reranked.score)} " +
-                                "pitch=[${pitchSummary(evidence)}]",
+                                "score=${"%.3f".format(chosen.originalScore)}->${"%.3f".format(chosen.score)} " +
+                                "harmony=[${pitchSummary(harmonyEvidence)}] " +
+                                "bass=[${pitchSummary(bassEvidence)}]",
                         )
                     }
                 }
@@ -277,7 +299,7 @@ class LvChordiaSongAnalyzer internal constructor(
             val endMs = frameToMs(frames[endFrameIndex])
             Log.d(
                 "PitchKitHarmony",
-                "LV ${startMs}-${endMs}ms hmm=${segment.label ?: "N"} " +
+                "LV Song ${startMs}-${endMs}ms hmm=${segment.label ?: "N"} " +
                     "rawTop=[$rawTop] ${diagnostic.headSummary}",
             )
         }
@@ -357,7 +379,7 @@ class LvChordiaSongAnalyzer internal constructor(
         val totalMs = (hmmDoneAt - startedAt) / 1_000_000.0
         Log.d(
             "PitchKitPerf",
-            "LV song frames=$frames chords=$chordCount cqt=${"%.1f".format(cqtMs)}ms " +
+            "LV Song frames=$frames chords=$chordCount cqt=${"%.1f".format(cqtMs)}ms " +
                 "ensemble=${"%.1f".format(ensembleMs)}ms hmm=${"%.1f".format(hmmMs)}ms " +
                 "total=${"%.1f".format(totalMs)}ms",
         )
