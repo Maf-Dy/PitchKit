@@ -1,0 +1,221 @@
+package com.nicos.pitchkit.tuner.harmony
+
+import kotlin.math.ln
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+internal data class PitchClassRerankResult(
+    val label: String,
+    val changed: Boolean,
+    val originalScore: Double,
+    val score: Double,
+)
+
+/**
+ * Conservative second opinion for chord spelling.
+ *
+ * The neural recognizer remains responsible for the root/triad family. This
+ * helper only resolves closely-related spellings from direct pitch-class
+ * evidence (7 vs 6/9, dim7 vs hdim7, etc.). A minor/diminished family switch is
+ * allowed only when the fifth evidence clearly supports it.
+ */
+internal object PitchClassChordReranker {
+    private data class Quality(
+        val suffix: String,
+        val family: Family,
+        val intervals: IntArray,
+        val triadIntervals: IntArray,
+    )
+
+    private enum class Family { MAJOR, MINOR, DIMINISHED, SUSPENDED, AUGMENTED }
+
+    private val roots = mapOf(
+        "C" to 0, "C#" to 1, "Db" to 1, "D" to 2, "D#" to 3, "Eb" to 3,
+        "E" to 4, "F" to 5, "F#" to 6, "Gb" to 6, "G" to 7,
+        "G#" to 8, "Ab" to 8, "A" to 9, "A#" to 10, "Bb" to 10, "B" to 11,
+    )
+
+    private val qualities = listOf(
+        Quality("", Family.MAJOR, intArrayOf(0, 4, 7), intArrayOf(0, 4, 7)),
+        Quality("6", Family.MAJOR, intArrayOf(0, 4, 7, 9), intArrayOf(0, 4, 7)),
+        Quality("6/9", Family.MAJOR, intArrayOf(0, 2, 4, 7, 9), intArrayOf(0, 4, 7)),
+        Quality("7", Family.MAJOR, intArrayOf(0, 4, 7, 10), intArrayOf(0, 4, 7)),
+        Quality("maj7", Family.MAJOR, intArrayOf(0, 4, 7, 11), intArrayOf(0, 4, 7)),
+        Quality("9", Family.MAJOR, intArrayOf(0, 2, 4, 7, 10), intArrayOf(0, 4, 7)),
+        Quality("maj9", Family.MAJOR, intArrayOf(0, 2, 4, 7, 11), intArrayOf(0, 4, 7)),
+        Quality("m", Family.MINOR, intArrayOf(0, 3, 7), intArrayOf(0, 3, 7)),
+        Quality("m6", Family.MINOR, intArrayOf(0, 3, 7, 9), intArrayOf(0, 3, 7)),
+        Quality("m7", Family.MINOR, intArrayOf(0, 3, 7, 10), intArrayOf(0, 3, 7)),
+        Quality("m(maj7)", Family.MINOR, intArrayOf(0, 3, 7, 11), intArrayOf(0, 3, 7)),
+        Quality("m9", Family.MINOR, intArrayOf(0, 2, 3, 7, 10), intArrayOf(0, 3, 7)),
+        Quality("dim", Family.DIMINISHED, intArrayOf(0, 3, 6), intArrayOf(0, 3, 6)),
+        Quality("dim7", Family.DIMINISHED, intArrayOf(0, 3, 6, 9), intArrayOf(0, 3, 6)),
+        Quality("ø7", Family.DIMINISHED, intArrayOf(0, 3, 6, 10), intArrayOf(0, 3, 6)),
+        Quality("sus2", Family.SUSPENDED, intArrayOf(0, 2, 7), intArrayOf(0, 2, 7)),
+        Quality("sus4", Family.SUSPENDED, intArrayOf(0, 5, 7), intArrayOf(0, 5, 7)),
+        Quality("aug", Family.AUGMENTED, intArrayOf(0, 4, 8), intArrayOf(0, 4, 8)),
+    )
+
+    fun rerank(label: String, evidence: FloatArray): PitchClassRerankResult {
+        require(evidence.size == 12)
+        val parsed = parse(label) ?: return unchanged(label)
+        val normalized = normalize(evidence)
+        val original = qualities.firstOrNull { it.suffix == parsed.suffix }
+            ?: return unchanged(label)
+
+        val allowedFamilies = mutableSetOf(original.family)
+        val diminishedFifth = normalized[(parsed.rootPc + 6) % 12]
+        val perfectFifth = normalized[(parsed.rootPc + 7) % 12]
+        if (original.family == Family.MINOR && diminishedFifth > perfectFifth + 0.14f) {
+            allowedFamilies += Family.DIMINISHED
+        } else if (original.family == Family.DIMINISHED && perfectFifth > diminishedFifth + 0.14f) {
+            allowedFamilies += Family.MINOR
+        }
+
+        val candidates = qualities.filter { it.family in allowedFamilies }
+        val originalScore = score(original, parsed.rootPc, normalized)
+        val best = candidates.maxByOrNull { score(it, parsed.rootPc, normalized) } ?: original
+        val bestScore = score(best, parsed.rootPc, normalized)
+
+        // Do not rewrite a model decision on weak/marginal evidence. Requiring a
+        // real score margin is what keeps passing melody tones from becoming
+        // invented chord extensions.
+        val changed = best.suffix != original.suffix &&
+            bestScore >= originalScore + 0.055 &&
+            requiredTonesSupported(best, parsed.rootPc, normalized)
+
+        val chosen = if (changed) best else original
+        val suffix = chosen.suffix
+        val rendered = buildString {
+            append(parsed.rootText)
+            append(suffix)
+            parsed.inversion?.let {
+                append('/')
+                append(it)
+            }
+        }
+        return PitchClassRerankResult(
+            label = rendered,
+            changed = changed,
+            originalScore = originalScore,
+            score = if (changed) bestScore else originalScore,
+        )
+    }
+
+    /** Fold CQT bins into 12 pitch classes over the newest frames. */
+    fun cqtEvidence(
+        values: FloatArray,
+        frameCount: Int,
+        binCount: Int,
+        fmin: Double,
+        binsPerOctave: Int,
+        logMagnitude: Boolean,
+        tailFrames: Int = 4,
+    ): FloatArray {
+        if (frameCount <= 0 || binCount <= 0 || values.size < frameCount * binCount) {
+            return FloatArray(12)
+        }
+        val result = DoubleArray(12)
+        val firstFrame = (frameCount - tailFrames.coerceAtLeast(1)).coerceAtLeast(0)
+        for (frame in firstFrame until frameCount) {
+            val offset = frame * binCount
+            for (bin in 0 until binCount) {
+                val frequency = fmin * 2.0.pow(bin.toDouble() / binsPerOctave.toDouble())
+                val midi = (69.0 + 12.0 * log2(frequency / 440.0)).roundToInt()
+                val pitchClass = floorMod12(midi)
+                val raw = values[offset + bin].toDouble()
+                val magnitude = if (logMagnitude) {
+                    kotlin.math.exp(raw).coerceAtMost(1e12)
+                } else {
+                    raw.coerceAtLeast(0.0)
+                }
+                // Compression prevents one bass fundamental from completely
+                // hiding upper chord tones.
+                result[pitchClass] += sqrt(magnitude.coerceAtLeast(0.0))
+            }
+        }
+        return normalize(result)
+    }
+
+    /** Average already-normalized per-frame chroma rows. */
+    fun averageEvidence(
+        chroma: FloatArray,
+        frameCount: Int,
+        frameIndices: IntRange,
+    ): FloatArray {
+        if (frameCount <= 0 || chroma.size < frameCount * 12) return FloatArray(12)
+        val result = DoubleArray(12)
+        var count = 0
+        val first = frameIndices.first.coerceIn(0, frameCount - 1)
+        val last = frameIndices.last.coerceIn(first, frameCount - 1)
+        for (frame in first..last) {
+            val offset = frame * 12
+            for (pc in 0 until 12) result[pc] += chroma[offset + pc]
+            count++
+        }
+        if (count > 0) for (pc in 0 until 12) result[pc] /= count.toDouble()
+        return normalize(result)
+    }
+
+    private fun score(quality: Quality, root: Int, evidence: FloatArray): Double {
+        val required = quality.intervals.map { evidence[(root + it) % 12].toDouble() }
+        val mean = required.average()
+        val weakest = required.minOrNull() ?: 0.0
+        val requiredSet = quality.intervals.map { (root + it) % 12 }.toSet()
+        val strongestOutside = evidence.indices
+            .filter { it !in requiredSet }
+            .maxOfOrNull { evidence[it].toDouble() }
+            ?: 0.0
+
+        var value = 0.56 * mean + 0.34 * weakest - 0.18 * strongestOutside
+        // Added tones must earn their way into the spelling.
+        val extensionCount = (quality.intervals.size - quality.triadIntervals.size).coerceAtLeast(0)
+        value -= 0.012 * extensionCount
+        return value
+    }
+
+    private fun requiredTonesSupported(quality: Quality, root: Int, evidence: FloatArray): Boolean {
+        val triad = quality.triadIntervals.map { evidence[(root + it) % 12] }
+        if (triad.any { it < 0.16f }) return false
+        val extensionIntervals = quality.intervals.filter { it !in quality.triadIntervals.toSet() }
+        if (extensionIntervals.isEmpty()) return true
+        val triadMean = triad.average().toFloat()
+        val threshold = maxOf(0.18f, triadMean * 0.28f)
+        return extensionIntervals.all { evidence[(root + it) % 12] >= threshold }
+    }
+
+    private data class Parsed(
+        val rootText: String,
+        val rootPc: Int,
+        val suffix: String,
+        val inversion: String?,
+    )
+
+    private fun parse(label: String): Parsed? {
+        if (label.isBlank()) return null
+        val slash = label.indexOf('/')
+        val chord = if (slash >= 0) label.substring(0, slash) else label
+        val inversion = if (slash >= 0 && slash + 1 < label.length) label.substring(slash + 1) else null
+        val rootText = when {
+            chord.length >= 2 && (chord[1] == '#' || chord[1] == 'b') -> chord.substring(0, 2)
+            else -> chord.substring(0, 1)
+        }
+        val rootPc = roots[rootText] ?: return null
+        val suffix = chord.substring(rootText.length)
+        return Parsed(rootText, rootPc, suffix, inversion)
+    }
+
+    private fun normalize(values: FloatArray): FloatArray = normalize(DoubleArray(12) { values[it].toDouble() })
+
+    private fun normalize(values: DoubleArray): FloatArray {
+        val peak = values.maxOrNull()?.coerceAtLeast(0.0) ?: 0.0
+        if (peak <= 1e-12) return FloatArray(12)
+        return FloatArray(12) { index -> (values[index] / peak).coerceIn(0.0, 1.0).toFloat() }
+    }
+
+    private fun unchanged(label: String) = PitchClassRerankResult(label, false, 0.0, 0.0)
+
+    private fun log2(value: Double): Double = ln(value) / ln(2.0)
+    private fun floorMod12(value: Int): Int = ((value % 12) + 12) % 12
+}
