@@ -3,6 +3,7 @@ package com.nicos.pitchkit.tuner.harmony.lvchordia
 import android.os.SystemClock
 import android.util.Log
 import com.nicos.pitchkit.BuildConfig
+import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
 import com.nicos.pitchkit.tuner.harmony.chordnet.StreamingPcmResampler
 import com.nicos.pitchkit.tuner.harmony.song.SongChordSegment
 import com.nicos.pitchkit.tuner.harmony.song.SongHarmonyAnalysis
@@ -102,10 +103,17 @@ class LvChordiaSongAnalyzer internal constructor(
         val frames = frameNumbers.toLongArray()
         require(frames.size == heads.frames)
 
-        val decoded = sequenceDecoder.decode(heads)
+        val modelDecoded = sequenceDecoder.decode(heads)
         val hmmDoneAt = SystemClock.elapsedRealtimeNanos()
-        require(decoded.size == frames.size)
-        logHarmonyDiagnostics(decoded, frames, heads)
+        require(modelDecoded.size == frames.size)
+        logHarmonyDiagnostics(modelDecoded, frames, heads)
+
+        val decoded = rerankExtensionsWithPitchEvidence(
+            decoded = modelDecoded,
+            frames = frames,
+            chroma = features.chroma,
+            chromaFrameCount = features.frameCount,
+        )
 
         val chords = buildChordSegments(decoded, frames, finalDuration)
         val result = SongHarmonyAnalysis(
@@ -174,6 +182,64 @@ class LvChordiaSongAnalyzer internal constructor(
         chords = emptyList(),
         sections = if (durationMs > 0L) listOf(SongSection("A", 0L, durationMs)) else emptyList(),
     )
+
+    private fun rerankExtensionsWithPitchEvidence(
+        decoded: List<LvChordiaDecodedFrame>,
+        frames: LongArray,
+        chroma: FloatArray,
+        chromaFrameCount: Int,
+    ): List<LvChordiaDecodedFrame> {
+        if (decoded.isEmpty() || chromaFrameCount <= 0 || chroma.size < chromaFrameCount * 12) {
+            return decoded
+        }
+
+        val result = decoded.toMutableList()
+        var start = 0
+        while (start < decoded.size) {
+            val label = decoded[start].label
+            var end = start + 1
+            while (end < decoded.size && decoded[end].label == label) end++
+
+            if (label != null) {
+                val firstSourceFrame = frames[start]
+                    .coerceIn(0L, (chromaFrameCount - 1).toLong())
+                    .toInt()
+                val lastSourceFrame = frames[end - 1]
+                    .coerceIn(firstSourceFrame.toLong(), (chromaFrameCount - 1).toLong())
+                    .toInt()
+                val evidence = PitchClassChordReranker.averageEvidence(
+                    chroma = chroma,
+                    frameCount = chromaFrameCount,
+                    frameIndices = firstSourceFrame..lastSourceFrame,
+                )
+                val reranked = PitchClassChordReranker.rerank(label, evidence)
+                if (reranked.changed) {
+                    for (index in start until end) {
+                        result[index] = decoded[index].copy(label = reranked.label)
+                    }
+                    if (BuildConfig.DEBUG) {
+                        Log.d(
+                            "PitchKitHarmony",
+                            "LV correction $label -> ${reranked.label} " +
+                                "frames=$firstSourceFrame-$lastSourceFrame " +
+                                "score=${"%.3f".format(reranked.originalScore)}->${"%.3f".format(reranked.score)} " +
+                                "pitch=[${pitchSummary(evidence)}]",
+                        )
+                    }
+                }
+            }
+            start = end
+        }
+        return result
+    }
+
+    private fun pitchSummary(evidence: FloatArray): String {
+        val names = arrayOf("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
+        return evidence.indices
+            .sortedByDescending { evidence[it] }
+            .take(6)
+            .joinToString(",") { index -> "${names[index]}=${"%.2f".format(evidence[index])}" }
+    }
 
     private fun logHarmonyDiagnostics(
         decoded: List<LvChordiaDecodedFrame>,
