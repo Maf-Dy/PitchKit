@@ -143,7 +143,7 @@ fun GuitarTunerListener(
             }
 
             when (chordEngine) {
-                ChordEngine.AUTO -> tryCrema() ?: tryChordNet()
+                ChordEngine.AUTO -> tryChordNet() ?: tryCrema()
                 ChordEngine.CREMA -> tryCrema()
                 ChordEngine.CHORD_NET -> tryChordNet()
                 ChordEngine.CLASSIC -> null
