@@ -9,7 +9,7 @@ import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
 import com.nicos.pitchkit.tuner.models.AudioFrame
 import java.security.MessageDigest
 
-/** Low-latency rolling recognizer for ChordNet 2E1D plus conservative CQT DSP rescue. */
+/** Low-latency rolling recognizer for ChordNet 2E1D plus temporal CQT/DSP fusion. */
 class ChordNetStreamingRecognizer(
     modelBytes: ByteArray,
     planBytes: ByteArray,
@@ -24,13 +24,14 @@ class ChordNetStreamingRecognizer(
         minimumConfidence = minimumConfidence,
         changeConfirmations = 2,
     )
+    private val gestureEvidence = LivePitchEvidenceAccumulator()
 
     private companion object {
         const val LIVE_CONTEXT_FRAMES = 32
         const val STARTUP_FRAMES = 10
         const val INFERENCE_STRIDE_FRAMES = 2
         const val LIVE_SMOOTHING_KERNEL = 5
-        const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.45
+        const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.80
 
         val JAZZ_RESCUE_SUFFIXES = listOf(
             "6/9", "m6", "dim7", "ø7", "m9", "9",
@@ -42,6 +43,7 @@ class ChordNetStreamingRecognizer(
 
     private var totalTargetSamples = 0L
     private var lastInferenceAt = 0L
+    private var closed = false
 
     init {
         require(referenceA4Hz in 300.0..600.0) { "referenceA4Hz must be between 300 and 600 Hz" }
@@ -59,7 +61,10 @@ class ChordNetStreamingRecognizer(
         )
     }
 
+    @Synchronized
     override fun recognize(frame: AudioFrame): ChordRecognition? {
+        if (closed) return null
+
         val targetSamples = resampler.process(frame.toMono(), frame.sampleRate)
         if (targetSamples.isEmpty()) return stabilizer.currentWithoutPrediction()
 
@@ -76,7 +81,7 @@ class ChordNetStreamingRecognizer(
         lastInferenceAt = totalTargetSamples
 
         val features = frontend.transform(audio.toFloatArray())
-        if (features.frameCount <= 0) return stabilizer.update(null)
+        if (features.frameCount <= 0 || closed) return stabilizer.update(null)
 
         val validFrames = features.frameCount.coerceAtMost(ChordNetContract.SEQUENCE_LENGTH)
         val modelInput = FloatArray(
@@ -99,6 +104,7 @@ class ChordNetStreamingRecognizer(
         }
 
         val logits = runner.infer(modelInput, windowCount = 1)
+        if (closed) return null
         val predictions = ChordNetPostProcessor.decode(
             logits = logits,
             windowCount = 1,
@@ -108,7 +114,7 @@ class ChordNetStreamingRecognizer(
         )
 
         val prediction = predictions[validFrames - 1]
-        val pitchEvidence = PitchClassChordReranker.cqtEvidence(
+        val currentPitchEvidence = PitchClassChordReranker.cqtEvidence(
             values = features.values,
             frameCount = features.frameCount,
             binCount = features.binCount,
@@ -117,7 +123,7 @@ class ChordNetStreamingRecognizer(
             logMagnitude = plan.config.logMagnitude,
             tailFrames = 4,
         )
-        val bassEvidence = PitchClassChordReranker.cqtBassEvidence(
+        val currentBassEvidence = PitchClassChordReranker.cqtBassEvidence(
             values = features.values,
             frameCount = features.frameCount,
             binCount = features.binCount,
@@ -126,6 +132,9 @@ class ChordNetStreamingRecognizer(
             logMagnitude = plan.config.logMagnitude,
             tailFrames = 4,
         )
+        val gesture = gestureEvidence.update(currentPitchEvidence, currentBassEvidence)
+        val pitchEvidence = gesture.pitch
+        val bassEvidence = gesture.bass
 
         val reranked = prediction.displayLabel?.let {
             PitchClassChordReranker.rerank(it, pitchEvidence)
@@ -147,13 +156,28 @@ class ChordNetStreamingRecognizer(
             isJazzRescueLabel(dsp.label) &&
             dsp.score >= 0.58 &&
             dsp.margin >= 0.022
-        val useDsp = when {
+        val useDsp = gesture.ready && when {
             dsp == null -> false
             modelLabel == null -> strongJazzDsp
             dsp.label == modelLabel -> false
-            prediction.confidence >= DSP_OVERRIDE_MODEL_CONFIDENCE -> false
             !strongJazzDsp -> false
+            prediction.confidence >= DSP_OVERRIDE_MODEL_CONFIDENCE -> false
             else -> true
+        }
+
+        // Do not publish a partial chord while new pitch classes are still being
+        // added to the current gesture. This is the key arpeggio/together-chord
+        // behavior: the gesture may resolve early when stable, but can collect
+        // evidence for roughly a second while notes continue arriving.
+        if (!gesture.ready) {
+            if (BuildConfig.DEBUG) {
+                Log.d(
+                    "PitchKitChord",
+                    "backend=ChordNet forming updates=${gesture.updateCount} " +
+                        "stable=${gesture.stableUpdates} raw=${prediction.displayLabel ?: "N"}",
+                )
+            }
+            return stabilizer.currentWithoutPrediction()
         }
 
         val finalLabel = if (useDsp) dsp!!.label else modelLabel
@@ -167,7 +191,7 @@ class ChordNetStreamingRecognizer(
             ChordRecognition(
                 label = it,
                 confidence = finalConfidence,
-                backend = if (useDsp) "ChordNet + CQT DSP" else "ChordNet 2E1D",
+                backend = if (useDsp) "ChordNet + temporal CQT DSP" else "ChordNet 2E1D",
             )
         }
         val emitted = stabilizer.update(rawRecognition)
@@ -195,23 +219,34 @@ class ChordNetStreamingRecognizer(
                 "PitchKitChord",
                 "backend=ChordNet raw=${prediction.displayLabel ?: "N"} " +
                     "model=${prediction.rawLabel} conf=${"%.3f".format(prediction.confidence)} " +
+                    "gesture=${gesture.updateCount}/${gesture.stableUpdates} " +
                     "top3=[$top]$correction emitted=${emitted?.label ?: "-"}",
             )
         }
         return emitted
     }
 
+    @Synchronized
     override fun reset() {
+        if (closed) return
+        resetState()
+    }
+
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        closed = true
+        runner.close()
+        resetState()
+    }
+
+    private fun resetState() {
         audio.clear()
         resampler.reset()
         totalTargetSamples = 0L
         lastInferenceAt = 0L
+        gestureEvidence.reset()
         stabilizer.reset()
-    }
-
-    override fun close() {
-        runner.close()
-        reset()
     }
 
     private fun isJazzRescueLabel(label: String): Boolean =
