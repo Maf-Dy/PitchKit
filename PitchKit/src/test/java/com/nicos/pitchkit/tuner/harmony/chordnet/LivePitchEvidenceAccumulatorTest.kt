@@ -39,7 +39,18 @@ class LivePitchEvidenceAccumulatorTest {
     }
 
     @Test
-    fun newPitchAfterReadyMakesGestureFormAgain() {
+    fun continuouslyGrowingPitchSetIsForcedReadyAtBound() {
+        val accumulator = LivePitchEvidenceAccumulator(forceReadyUpdates = 5)
+
+        assertFalse(accumulator.update(evidence(7), evidence(7)).ready)
+        assertFalse(accumulator.update(evidence(7, 11), evidence(7)).ready)
+        assertFalse(accumulator.update(evidence(7, 11, 2), evidence(7)).ready)
+        assertFalse(accumulator.update(evidence(7, 11, 2, 4), evidence(7)).ready)
+        assertTrue(accumulator.update(evidence(7, 11, 2, 4, 9), evidence(7)).ready)
+    }
+
+    @Test
+    fun newPitchAfterReadyStartsFreshDecisionWindow() {
         val accumulator = LivePitchEvidenceAccumulator()
         val g = evidence(7, 11, 2)
 
