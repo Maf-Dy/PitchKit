@@ -26,3 +26,6 @@ local.properties
 /PitchKit/src/main/assets/lvchordia/*.onnx
 /PitchKit/src/main/assets/lvchordia/*.bin
 /PitchKit/src/main/assets/lvchordia/*.json
+/PitchKit/src/main/assets/consonance/*.onnx
+/PitchKit/src/main/assets/consonance/*.bin
+/PitchKit/src/main/assets/consonance/*.json
