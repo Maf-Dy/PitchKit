@@ -1,5 +1,6 @@
 package com.nicos.pitchkit.tuner.harmony.btc
 
+import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
 import com.nicos.pitchkit.tuner.harmony.chordnet.ChordNetVocabulary
 import com.nicos.pitchkit.tuner.harmony.chordnet.CqtCpuFrontend
 import com.nicos.pitchkit.tuner.harmony.chordnet.CqtPlanDecoder
@@ -13,9 +14,8 @@ import kotlin.math.exp
 import kotlin.math.max
 
 /**
- * Full-song BTC analyzer matching ChordMini's recommended offline evaluation path:
- * 50% overlap, Gaussian logit smoothing, logit aggregation, categorical smoothing,
- * and 0.5 s minimum segment duration.
+ * Full-song BTC analyzer matching ChordMini's recommended offline evaluation path,
+ * followed by conservative segment-level pitch-content refinement.
  */
 class BtcSongAnalyzer internal constructor(
     modelBytes: ByteArray,
@@ -26,6 +26,7 @@ class BtcSongAnalyzer internal constructor(
 ) : AutoCloseable {
     private companion object {
         const val INFERENCE_BATCH_WINDOWS = 8
+        const val CQT_FMIN = 32.70319566257483
     }
 
     private val runner = BtcOnnxRunner(modelBytes, metadata.modelSha256)
@@ -59,7 +60,6 @@ class BtcSongAnalyzer internal constructor(
         frontend = CqtCpuFrontend(plan)
     }
 
-    /** Feed decoded mono PCM values in the -1..1 range. */
     @Synchronized
     fun accept(samples: FloatArray, sampleRate: Int) {
         check(!closed) { "BtcSongAnalyzer is closed" }
@@ -105,7 +105,7 @@ class BtcSongAnalyzer internal constructor(
             predictions.size
         }
         val validPredictions = predictions.take(minOf(predictions.size, maxFramesFromDuration))
-        val chords = buildSegments(validPredictions, finalDuration)
+        val chords = buildSegments(validPredictions, finalDuration, cqt)
         return SongHarmonyAnalysis(
             durationMs = finalDuration,
             chords = chords,
@@ -148,9 +148,7 @@ class BtcSongAnalyzer internal constructor(
                     val sourceFrame = sourceStartFrame + frame
                     if (sourceFrame >= frameCount) break
                     val sourceOffset = sourceFrame * BtcContract.INPUT_BINS
-                    val destinationOffset = (
-                        localWindow * seq + frame
-                    ) * BtcContract.INPUT_BINS
+                    val destinationOffset = (localWindow * seq + frame) * BtcContract.INPUT_BINS
                     normalizedFeatures.copyInto(
                         destination = batch,
                         destinationOffset = destinationOffset,
@@ -168,9 +166,7 @@ class BtcSongAnalyzer internal constructor(
                 for (frame in 0 until seq) {
                     val globalFrame = globalStart + frame
                     if (globalFrame >= frameCount) break
-                    val sourceOffset = (
-                        localWindow * seq + frame
-                    ) * BtcContract.CHORD_COUNT
+                    val sourceOffset = (localWindow * seq + frame) * BtcContract.CHORD_COUNT
                     val destinationOffset = globalFrame * BtcContract.CHORD_COUNT
                     for (chord in 0 until BtcContract.CHORD_COUNT) {
                         accumulator[destinationOffset + chord] += smoothed[sourceOffset + chord]
@@ -207,29 +203,18 @@ class BtcSongAnalyzer internal constructor(
             }
             var softmaxDenominator = 0.0
             for (chord in 0 until BtcContract.CHORD_COUNT) {
-                softmaxDenominator += exp(
-                    (accumulator[offset + chord] / count).toDouble() - maxLogit
-                )
+                softmaxDenominator += exp((accumulator[offset + chord] / count).toDouble() - maxLogit)
             }
             val label = filteredIndices[frame]
-            val selectedNumerator = exp(
-                (accumulator[offset + label] / count).toDouble() - maxLogit
-            )
+            val selectedNumerator = exp((accumulator[offset + label] / count).toDouble() - maxLogit)
             FrameResult(
                 labelIndex = label,
-                confidence = if (softmaxDenominator > 0.0) {
-                    selectedNumerator / softmaxDenominator
-                } else {
-                    0.0
-                },
+                confidence = if (softmaxDenominator > 0.0) selectedNumerator / softmaxDenominator else 0.0,
             )
         }
     }
 
-    private fun gaussianSmoothLogits(
-        logits: FloatArray,
-        windowCount: Int,
-    ): FloatArray {
+    private fun gaussianSmoothLogits(logits: FloatArray, windowCount: Int): FloatArray {
         val kernelSize = BtcContract.SMOOTHING_KERNEL
         val radius = kernelSize / 2
         val sigma = kernelSize / 6.0
@@ -282,11 +267,11 @@ class BtcSongAnalyzer internal constructor(
     private fun buildSegments(
         predictions: List<FrameResult>,
         durationMs: Long,
+        cqt: CqtCpuFrontend.Features,
     ): List<SongChordSegment> {
         if (predictions.isEmpty()) return emptyList()
         val minimumFrames = ceil(
-            BtcContract.MIN_SEGMENT_SECONDS * BtcContract.SAMPLE_RATE /
-                BtcContract.HOP_LENGTH
+            BtcContract.MIN_SEGMENT_SECONDS * BtcContract.SAMPLE_RATE / BtcContract.HOP_LENGTH
         ).toInt().coerceAtLeast(1)
 
         val result = mutableListOf<SongChordSegment>()
@@ -302,13 +287,57 @@ class BtcSongAnalyzer internal constructor(
                 val startMs = frameToMs(start)
                 val endMs = minOf(durationMs, frameToMs(end)).coerceAtLeast(startMs)
                 if (endMs > startMs) {
+                    val cqtEnd = minOf(end, cqt.frameCount)
+                    val frameCount = (cqtEnd - start).coerceAtLeast(0)
+                    val segmentValues = if (frameCount > 0) {
+                        cqt.values.copyOfRange(
+                            start * BtcContract.INPUT_BINS,
+                            cqtEnd * BtcContract.INPUT_BINS,
+                        )
+                    } else {
+                        FloatArray(0)
+                    }
+                    val pitchEvidence = if (frameCount > 0) {
+                        PitchClassChordReranker.cqtEvidence(
+                            values = segmentValues,
+                            frameCount = frameCount,
+                            binCount = BtcContract.INPUT_BINS,
+                            fmin = CQT_FMIN,
+                            binsPerOctave = 24,
+                            logMagnitude = true,
+                            tailFrames = frameCount,
+                        )
+                    } else FloatArray(12)
+                    val bassEvidence = if (frameCount > 0) {
+                        PitchClassChordReranker.cqtBassEvidence(
+                            values = segmentValues,
+                            frameCount = frameCount,
+                            binCount = BtcContract.INPUT_BINS,
+                            fmin = CQT_FMIN,
+                            binsPerOctave = 24,
+                            logMagnitude = true,
+                            tailFrames = frameCount,
+                        )
+                    } else FloatArray(12)
+
+                    val baseLabel = displayLabel(rawLabel)
+                    val reranked = PitchClassChordReranker.rerank(baseLabel, pitchEvidence)
+                    val rootResolved = PitchClassChordReranker.resolveEquivalentRoot(
+                        label = reranked.label,
+                        pitchEvidence = pitchEvidence,
+                        bassEvidence = bassEvidence,
+                    )
+                    val finalLabel = if (rootResolved.changed) rootResolved.label else reranked.label
                     result += SongChordSegment(
-                        label = displayLabel(rawLabel),
+                        label = finalLabel,
                         startMs = startMs,
                         endMs = endMs,
-                        confidence = predictions.subList(start, end)
-                            .map { it.confidence }
-                            .average(),
+                        confidence = predictions.subList(start, end).map { it.confidence }.average(),
+                        root = rootFromLabel(finalLabel),
+                        pitchClasses = pitchEvidence.indices
+                            .filter { pitchEvidence[it] >= 0.30f }
+                            .sortedByDescending { pitchEvidence[it] }
+                            .map(::noteName),
                     )
                 }
             }
@@ -317,16 +346,23 @@ class BtcSongAnalyzer internal constructor(
         return result
     }
 
+    private fun rootFromLabel(label: String): String? = when {
+        label.isBlank() -> null
+        label.length >= 2 && (label[1] == '#' || label[1] == 'b') -> label.substring(0, 2)
+        label[0] in 'A'..'G' -> label.substring(0, 1)
+        else -> null
+    }
+
+    private fun noteName(pc: Int): String {
+        val sharps = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+        val flats = arrayOf("C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B")
+        return if (preferFlats) flats[pc] else sharps[pc]
+    }
+
     private fun displayLabel(raw: String): String {
         var display = ChordNetVocabulary.toDisplay(raw)
         if (!preferFlats) return display
-        val flats = mapOf(
-            "C#" to "Db",
-            "D#" to "Eb",
-            "F#" to "Gb",
-            "G#" to "Ab",
-            "A#" to "Bb",
-        )
+        val flats = mapOf("C#" to "Db", "D#" to "Eb", "F#" to "Gb", "G#" to "Ab", "A#" to "Bb")
         for ((sharp, flat) in flats) {
             if (display.startsWith(sharp)) {
                 display = flat + display.removePrefix(sharp)
