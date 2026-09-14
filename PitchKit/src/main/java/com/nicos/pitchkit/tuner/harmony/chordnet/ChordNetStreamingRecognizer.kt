@@ -127,7 +127,6 @@ class ChordNetStreamingRecognizer(
             tailFrames = 4,
         )
 
-        // First try to repair a related neural spelling.
         val reranked = prediction.displayLabel?.let {
             PitchClassChordReranker.rerank(it, pitchEvidence)
         }
@@ -140,19 +139,20 @@ class ChordNetStreamingRecognizer(
         }
         val modelLabel = rootResolved?.label ?: reranked?.label ?: prediction.displayLabel
 
-        // Then run an independent pitch-template detector. This is what rescues
-        // hdim7/m6/dim7 when ChordNet says N or chooses the wrong family/root.
         val dsp = CqtChordTemplateDetector.detect(
             pitchEvidence = pitchEvidence,
             bassEvidence = bassEvidence,
         )
+        val strongJazzDsp = dsp != null &&
+            isJazzRescueLabel(dsp.label) &&
+            dsp.score >= 0.58 &&
+            dsp.margin >= 0.022
         val useDsp = when {
             dsp == null -> false
-            modelLabel == null -> true
+            modelLabel == null -> strongJazzDsp
             dsp.label == modelLabel -> false
             prediction.confidence >= DSP_OVERRIDE_MODEL_CONFIDENCE -> false
-            !isJazzRescueLabel(dsp.label) -> false
-            dsp.score < 0.58 || dsp.margin < 0.022 -> false
+            !strongJazzDsp -> false
             else -> true
         }
 
