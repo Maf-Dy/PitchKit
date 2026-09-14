@@ -89,6 +89,47 @@ class PitchClassChordRerankerTest {
     }
 
     @Test
+    fun resolvesAm6AsFSharpHalfDiminishedWhenFSharpOwnsTheBass() {
+        val pitch = evidence(
+            "F#" to 1.00f,
+            "A" to 0.95f,
+            "C" to 0.90f,
+            "E" to 0.87f,
+        )
+        val bass = evidence(
+            "F#" to 1.00f,
+            "A" to 0.48f,
+            "C" to 0.20f,
+            "E" to 0.12f,
+        )
+
+        val result = PitchClassChordReranker.resolveEquivalentRoot("Am6", pitch, bass)
+
+        assertTrue(result.changed)
+        assertEquals("F#ø7", result.label)
+    }
+
+    @Test
+    fun keepsAm6WhenAOwnsTheBass() {
+        val pitch = evidence(
+            "F#" to 0.91f,
+            "A" to 1.00f,
+            "C" to 0.92f,
+            "E" to 0.88f,
+        )
+        val bass = evidence(
+            "A" to 1.00f,
+            "F#" to 0.45f,
+            "E" to 0.20f,
+        )
+
+        val result = PitchClassChordReranker.resolveEquivalentRoot("Am6", pitch, bass)
+
+        assertFalse(result.changed)
+        assertEquals("Am6", result.label)
+    }
+
+    @Test
     fun sixNineWithRealInversionIsParsedAndPreserved() {
         val evidence = evidence(
             "G" to 1.00f,
