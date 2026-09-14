@@ -102,7 +102,12 @@ internal class CremaSongViterbiDecoder(
             val raw = state.labels[stateIndex]
             val parsed = parse(raw)
             val rootPc = parsed?.first
-            val bassPc = rootPc?.let { chosenBass(it, parsed.second, observation.bass) }
+            val quality = parsed?.second
+            val bassPc = if (rootPc != null && quality != null) {
+                chosenBass(rootPc, quality, observation.bass)
+            } else {
+                null
+            }
             Prediction(
                 frame = observation.frame,
                 label = displayLabel(raw, observation.bass),
