@@ -229,24 +229,40 @@ class LvChordiaSongAnalyzer internal constructor(
                     frameIndices = frameRange,
                 )
 
-                val reranked = PitchClassChordReranker.rerank(label, harmonyEvidence)
+                val dictionaryReranked = LvSongDictionaryPitchReranker.rerank(
+                    label = label,
+                    candidates = dictionary.candidates,
+                    harmonyEvidence = harmonyEvidence,
+                    bassEvidence = bassEvidence,
+                )
                 val rootResolved = PitchClassChordReranker.resolveEquivalentRoot(
-                    label = reranked.label,
+                    label = dictionaryReranked.label,
                     pitchEvidence = harmonyEvidence,
                     bassEvidence = bassEvidence,
                 )
-                val chosen = if (rootResolved.changed) rootResolved else reranked
+                val chosenLabel = if (rootResolved.changed) {
+                    rootResolved.label
+                } else {
+                    dictionaryReranked.label
+                }
+                val changed = chosenLabel != label
 
-                if (chosen.changed) {
+                if (changed) {
                     for (index in start until end) {
-                        result[index] = decoded[index].copy(label = chosen.label)
+                        result[index] = decoded[index].copy(label = chosenLabel)
                     }
                     if (BuildConfig.DEBUG) {
+                        val rootText = if (rootResolved.changed) {
+                            " root=${dictionaryReranked.label}->${rootResolved.label}"
+                        } else {
+                            ""
+                        }
                         Log.d(
                             "PitchKitHarmony",
-                            "LV Song correction $label -> ${chosen.label} " +
+                            "LV Song correction $label -> $chosenLabel " +
                                 "frames=$firstSourceFrame-$lastSourceFrame " +
-                                "score=${"%.3f".format(chosen.originalScore)}->${"%.3f".format(chosen.score)} " +
+                                "dictScore=${"%.3f".format(dictionaryReranked.originalScore)}->" +
+                                "${"%.3f".format(dictionaryReranked.score)}$rootText " +
                                 "harmony=[${pitchSummary(harmonyEvidence)}] " +
                                 "bass=[${pitchSummary(bassEvidence)}]",
                         )
