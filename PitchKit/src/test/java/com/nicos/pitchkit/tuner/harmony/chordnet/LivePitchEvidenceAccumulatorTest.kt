@@ -38,6 +38,19 @@ class LivePitchEvidenceAccumulatorTest {
         assertTrue(accumulator.update(chord, evidence(7)).ready)
     }
 
+    @Test
+    fun newPitchAfterReadyMakesGestureFormAgain() {
+        val accumulator = LivePitchEvidenceAccumulator()
+        val g = evidence(7, 11, 2)
+
+        assertFalse(accumulator.update(g, evidence(7)).ready)
+        assertTrue(accumulator.update(g, evidence(7)).ready)
+
+        val g7 = evidence(7, 11, 2, 5)
+        assertFalse(accumulator.update(g7, evidence(7)).ready)
+        assertTrue(accumulator.update(g7, evidence(7)).ready)
+    }
+
     private fun evidence(vararg pitchClasses: Int): FloatArray = FloatArray(12) { index ->
         if (index in pitchClasses) 1f else 0f
     }
