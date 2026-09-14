@@ -86,10 +86,9 @@ internal object PitchClassChordReranker {
             requiredTonesSupported(best, parsed.rootPc, normalized)
 
         val chosen = if (changed) best else original
-        val suffix = chosen.suffix
         val rendered = buildString {
             append(parsed.rootText)
-            append(suffix)
+            append(chosen.suffix)
             parsed.inversion?.let {
                 append('/')
                 append(it)
@@ -178,7 +177,8 @@ internal object PitchClassChordReranker {
     private fun requiredTonesSupported(quality: Quality, root: Int, evidence: FloatArray): Boolean {
         val triad = quality.triadIntervals.map { evidence[(root + it) % 12] }
         if (triad.any { it < 0.16f }) return false
-        val extensionIntervals = quality.intervals.filter { it !in quality.triadIntervals.toSet() }
+        val triadSet = quality.triadIntervals.toSet()
+        val extensionIntervals = quality.intervals.filter { it !in triadSet }
         if (extensionIntervals.isEmpty()) return true
         val triadMean = triad.average().toFloat()
         val threshold = maxOf(0.18f, triadMean * 0.28f)
@@ -194,15 +194,33 @@ internal object PitchClassChordReranker {
 
     private fun parse(label: String): Parsed? {
         if (label.isBlank()) return null
-        val slash = label.indexOf('/')
-        val chord = if (slash >= 0) label.substring(0, slash) else label
-        val inversion = if (slash >= 0 && slash + 1 < label.length) label.substring(slash + 1) else null
+
         val rootText = when {
-            chord.length >= 2 && (chord[1] == '#' || chord[1] == 'b') -> chord.substring(0, 2)
-            else -> chord.substring(0, 1)
+            label.length >= 2 && (label[1] == '#' || label[1] == 'b') -> label.substring(0, 2)
+            else -> label.substring(0, 1)
         }
         val rootPc = roots[rootText] ?: return null
-        val suffix = chord.substring(rootText.length)
+        val remainder = label.substring(rootText.length)
+
+        // 6/9 contains a slash as part of the quality, not as an inversion marker.
+        val suffix: String
+        val inversion: String?
+        if (remainder.startsWith("6/9")) {
+            suffix = "6/9"
+            inversion = if (remainder.startsWith("6/9/") && remainder.length > 4) {
+                remainder.substring(4)
+            } else {
+                null
+            }
+        } else {
+            val slash = remainder.indexOf('/')
+            suffix = if (slash >= 0) remainder.substring(0, slash) else remainder
+            inversion = if (slash >= 0 && slash + 1 < remainder.length) {
+                remainder.substring(slash + 1)
+            } else {
+                null
+            }
+        }
         return Parsed(rootText, rootPc, suffix, inversion)
     }
 
