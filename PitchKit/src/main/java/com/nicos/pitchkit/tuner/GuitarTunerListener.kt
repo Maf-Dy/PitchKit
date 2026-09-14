@@ -86,7 +86,8 @@ fun GuitarTunerListener(
     }
 
     var neuralRecognizer by remember { mutableStateOf<ChordRecognizer?>(null) }
-    var neuralLoadFailed by remember { mutableStateOf(false) }
+    var neuralRecognizerSelection by remember { mutableStateOf<ChordEngine?>(null) }
+    var neuralLoadFailedSelection by remember { mutableStateOf<ChordEngine?>(null) }
 
     LaunchedEffect(
         mode,
@@ -98,13 +99,17 @@ fun GuitarTunerListener(
     ) {
         if (mode != DetectionMode.CHORD || chordEngine == ChordEngine.CLASSIC) {
             neuralRecognizer = null
-            neuralLoadFailed = false
+            neuralRecognizerSelection = null
+            neuralLoadFailedSelection = null
             return@LaunchedEffect
         }
 
-        neuralLoadFailed = false
+        val requestedSelection = chordEngine
         neuralRecognizer = null
-        neuralRecognizer = withContext(Dispatchers.IO) {
+        neuralRecognizerSelection = null
+        neuralLoadFailedSelection = null
+
+        val loaded = withContext(Dispatchers.IO) {
             fun tryCrema(): ChordRecognizer? {
                 if (!cremaAssetsInstalled) {
                     if (BuildConfig.DEBUG) Log.d("PitchKit", "Crema assets are not installed")
@@ -142,16 +147,19 @@ fun GuitarTunerListener(
                 }
             }
 
-            when (chordEngine) {
+            when (requestedSelection) {
                 ChordEngine.AUTO -> tryChordNet() ?: tryCrema()
                 ChordEngine.CREMA -> tryCrema()
                 ChordEngine.CHORD_NET -> tryChordNet()
                 ChordEngine.CLASSIC -> null
             }
         }
-        neuralLoadFailed = neuralRecognizer == null
-        if (neuralLoadFailed && BuildConfig.DEBUG) {
-            Log.d("PitchKit", "${chordEngine.name} unavailable; using Classic DSP")
+
+        neuralRecognizer = loaded
+        neuralRecognizerSelection = if (loaded != null) requestedSelection else null
+        neuralLoadFailedSelection = if (loaded == null) requestedSelection else null
+        if (loaded == null && BuildConfig.DEBUG) {
+            Log.d("PitchKit", "${requestedSelection.name} unavailable; using Classic DSP")
         }
     }
 
@@ -191,11 +199,15 @@ fun GuitarTunerListener(
         if (!granted) launcher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
+    val activeNeuralRecognizer = neuralRecognizer.takeIf {
+        mode == DetectionMode.CHORD && neuralRecognizerSelection == chordEngine
+    }
+    val loadFailedForCurrentSelection = neuralLoadFailedSelection == chordEngine
     val waitingForNeural = mode == DetectionMode.CHORD &&
         chordEngine != ChordEngine.CLASSIC &&
         selectedNeuralAssetsInstalled &&
-        neuralRecognizer == null &&
-        !neuralLoadFailed
+        activeNeuralRecognizer == null &&
+        !loadFailedForCurrentSelection
 
     if (granted && !waitingForNeural) {
         val engine = remember(
@@ -206,9 +218,9 @@ fun GuitarTunerListener(
             highPassCutoffHz,
             autoChordThreshold,
             chordMinScore,
-            neuralRecognizer,
+            activeNeuralRecognizer,
         ) {
-            val neural = neuralRecognizer
+            val neural = activeNeuralRecognizer
             val neuralSampleRate = when (neural) {
                 is CremaStreamingRecognizer -> CremaContract.SAMPLE_RATE
                 is ChordNetStreamingRecognizer -> ChordNetContract.SAMPLE_RATE
