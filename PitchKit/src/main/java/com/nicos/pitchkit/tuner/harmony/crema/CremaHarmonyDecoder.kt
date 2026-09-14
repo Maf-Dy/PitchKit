@@ -1,9 +1,6 @@
 package com.nicos.pitchkit.tuner.harmony.crema
 
 import com.nicos.pitchkit.BuildConfig
-import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
-import kotlin.math.exp
-import kotlin.math.ln
 import kotlin.math.max
 
 internal data class CremaCandidateDiagnostic(
@@ -20,7 +17,15 @@ internal data class CremaDecodedChord(
     val alternatives: List<CremaCandidateDiagnostic> = emptyList(),
 )
 
-/** Live decoder that fuses Crema's chord tag, root and pitch-content heads. */
+/**
+ * Low-latency Crema decoder.
+ *
+ * Crema's reference chord prediction is driven by the chord-tag head. Root and
+ * pitch-content heads are auxiliary structured outputs; treating them as extra
+ * class-voting terms can move a correct tag prediction to another chord. Keep
+ * the model's tag decision authoritative here. Temporal pitch evidence may make
+ * a conservative extension/root correction later in the streaming recognizer.
+ */
 internal class CremaHarmonyDecoder(
     private val state: CremaRuntimeState,
     private val preferFlats: Boolean = false,
@@ -51,54 +56,32 @@ internal class CremaHarmonyDecoder(
         val first = frameCount - count
 
         val tag = average(heads.tag, CremaContract.CHORD_COUNT, first, frameCount)
-        val pitch = average(heads.pitch, CremaContract.PITCH_COUNT, first, frameCount)
-        val root = average(heads.root, CremaContract.ROOT_COUNT, first, frameCount)
         val bass = average(heads.bass, CremaContract.BASS_COUNT, first, frameCount)
 
         var noChordProbability = 0.0
-        for (index in state.labels.indices) {
-            if (state.labels[index] == "N" || state.labels[index] == "X") {
-                noChordProbability = max(noChordProbability, tag[index].toDouble().coerceIn(0.0, 1.0))
-            }
-        }
-
         var bestIndex = -1
-        var bestScore = Double.NEGATIVE_INFINITY
-        val diagnostics = if (BuildConfig.DEBUG) mutableListOf<ScoredCandidate>() else null
+        var bestProbability = Double.NEGATIVE_INFINITY
+        val diagnostics = if (BuildConfig.DEBUG) mutableListOf<CremaCandidateDiagnostic>() else null
 
         for (index in state.labels.indices) {
-            val label = state.labels[index]
-            val parsed = parse(label) ?: continue
-            val (rootPc, quality) = parsed
-            val intervals = qualityIntervals[quality] ?: continue
+            val raw = state.labels[index]
+            val probability = tag[index].toDouble().coerceIn(0.0, 1.0)
+            if (raw == "N" || raw == "X") {
+                noChordProbability = max(noChordProbability, probability)
+                continue
+            }
 
-            val tagProbability = tag[index].coerceIn(1e-7f, 1.0f)
-            val rootProbability = root[rootPc].coerceIn(1e-7f, 1.0f)
-            val tones = intervals.map { (rootPc + it) % 12 }.toSet()
-            val meanRequired = tones.map { pitch[it].toDouble() }.average().coerceIn(1e-7, 1.0)
-            val strongestOutside = pitch.indices
-                .filter { it !in tones }
-                .maxOfOrNull { pitch[it].toDouble() }
-                ?.coerceIn(0.0, 1.0)
-                ?: 0.0
-            val pitchFit = (0.80 * meanRequired + 0.20 * (1.0 - strongestOutside))
-                .coerceIn(1e-7, 1.0)
-
-            val score = 0.70 * ln(tagProbability.toDouble()) +
-                0.15 * ln(rootProbability.toDouble()) +
-                0.15 * ln(pitchFit)
-
-            if (score > bestScore) {
-                bestScore = score
+            val parsed = parse(raw) ?: continue
+            if (probability > bestProbability) {
+                bestProbability = probability
                 bestIndex = index
             }
-
             diagnostics?.add(
-                ScoredCandidate(
-                    label = noteName(rootPc) + displayQuality(quality),
-                    rawLabel = label,
-                    score = score,
-                    tagConfidence = tagProbability.toDouble(),
+                CremaCandidateDiagnostic(
+                    label = noteName(parsed.first) + displayQuality(parsed.second),
+                    rawLabel = raw,
+                    fit = probability,
+                    tagConfidence = probability,
                 )
             )
         }
@@ -126,27 +109,15 @@ internal class CremaHarmonyDecoder(
                 append(noteName(bassPc))
             }
         }
-        val reranked = PitchClassChordReranker.rerank(modelLabel, pitch)
-        val finalLabel = reranked.label
-
-        val alternatives = diagnostics
-            ?.sortedByDescending { it.score }
-            ?.take(3)
-            ?.map {
-                CremaCandidateDiagnostic(
-                    label = it.label,
-                    rawLabel = it.rawLabel,
-                    fit = exp(it.score).coerceIn(0.0, 1.0),
-                    tagConfidence = it.tagConfidence.coerceIn(0.0, 1.0),
-                )
-            }
-            .orEmpty()
 
         return CremaDecodedChord(
-            label = finalLabel,
+            label = modelLabel,
             rawLabel = raw,
             confidence = chordTagProbability,
-            alternatives = alternatives,
+            alternatives = diagnostics
+                ?.sortedByDescending { it.tagConfidence }
+                ?.take(3)
+                .orEmpty(),
         )
     }
 
@@ -192,11 +163,4 @@ internal class CremaHarmonyDecoder(
         "sus4" -> "sus4"
         else -> ":$quality"
     }
-
-    private data class ScoredCandidate(
-        val label: String,
-        val rawLabel: String,
-        val score: Double,
-        val tagConfidence: Double,
-    )
 }
