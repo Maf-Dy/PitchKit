@@ -1,6 +1,7 @@
 package com.nicos.pitchkit.tuner.harmony.crema
 
 import com.nicos.pitchkit.BuildConfig
+import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -117,7 +118,7 @@ internal class CremaHarmonyDecoder(
         val relativeBass = (bassPc - rootPc + 12) % 12
         val validInversion = relativeBass != 0 && chordTones.contains(relativeBass)
 
-        val label = buildString {
+        val modelLabel = buildString {
             append(noteName(rootPc))
             append(displayQuality(quality))
             if (validInversion) {
@@ -125,6 +126,8 @@ internal class CremaHarmonyDecoder(
                 append(noteName(bassPc))
             }
         }
+        val reranked = PitchClassChordReranker.rerank(modelLabel, pitch)
+        val finalLabel = reranked.label
 
         val alternatives = diagnostics
             ?.sortedByDescending { it.score }
@@ -140,7 +143,7 @@ internal class CremaHarmonyDecoder(
             .orEmpty()
 
         return CremaDecodedChord(
-            label = label,
+            label = finalLabel,
             rawLabel = raw,
             confidence = chordTagProbability,
             alternatives = alternatives,
