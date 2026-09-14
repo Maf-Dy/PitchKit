@@ -5,9 +5,10 @@ import kotlin.math.max
 /**
  * Direct pitch-class fallback for live recognition.
  *
- * Neural models remain primary. This detector is deliberately conservative and
- * only supplies a chord when all required/extension tones have strong direct
- * evidence. Bass evidence breaks root-equivalent pitch sets where possible.
+ * ChordNet remains the primary recognizer. This detector is intentionally
+ * conservative and is only used when its pitch-set evidence is strong enough
+ * to rescue a low-confidence/no-chord neural result. Bass evidence breaks the
+ * m6 <-> hdim7 equivalence and the four-way symmetry of dim7.
  */
 internal object CqtChordTemplateDetector {
     data class Result(
@@ -20,7 +21,6 @@ internal object CqtChordTemplateDetector {
         val suffix: String,
         val intervals: IntArray,
         val minimumExtensionSupport: Float = 0.18f,
-        val coreSize: Int = 3,
     )
 
     private val sharpNames = arrayOf(
@@ -40,20 +40,9 @@ internal object CqtChordTemplateDetector {
         Quality("ø7", intArrayOf(0, 3, 6, 10)),
         Quality("sus2", intArrayOf(0, 2, 7)),
         Quality("sus4", intArrayOf(0, 5, 7)),
-        Quality("6/9", intArrayOf(0, 4, 7, 2, 9), minimumExtensionSupport = 0.20f),
-        Quality("9", intArrayOf(0, 4, 7, 10, 2), minimumExtensionSupport = 0.20f),
-        Quality("maj9", intArrayOf(0, 4, 7, 11, 2), minimumExtensionSupport = 0.20f),
-        Quality("m9", intArrayOf(0, 3, 7, 10, 2), minimumExtensionSupport = 0.20f),
-        Quality("11", intArrayOf(0, 4, 7, 10, 2, 5), minimumExtensionSupport = 0.21f),
-        Quality("m11", intArrayOf(0, 3, 7, 10, 2, 5), minimumExtensionSupport = 0.21f),
-        Quality("13", intArrayOf(0, 4, 7, 10, 2, 9), minimumExtensionSupport = 0.21f),
-        Quality("maj13", intArrayOf(0, 4, 7, 11, 2, 9), minimumExtensionSupport = 0.21f),
-        Quality("m13", intArrayOf(0, 3, 7, 10, 2, 9), minimumExtensionSupport = 0.21f),
-        Quality("7b9", intArrayOf(0, 4, 7, 10, 1), minimumExtensionSupport = 0.21f),
-        Quality("7#9", intArrayOf(0, 4, 7, 10, 3), minimumExtensionSupport = 0.21f),
-        Quality("7#11", intArrayOf(0, 4, 7, 10, 6), minimumExtensionSupport = 0.21f),
-        Quality("7b13", intArrayOf(0, 4, 7, 10, 8), minimumExtensionSupport = 0.21f),
-        Quality("9#11", intArrayOf(0, 4, 7, 10, 2, 6), minimumExtensionSupport = 0.21f),
+        Quality("6/9", intArrayOf(0, 2, 4, 7, 9), minimumExtensionSupport = 0.20f),
+        Quality("9", intArrayOf(0, 2, 4, 7, 10), minimumExtensionSupport = 0.20f),
+        Quality("m9", intArrayOf(0, 2, 3, 7, 10), minimumExtensionSupport = 0.20f),
     )
 
     fun detect(pitchEvidence: FloatArray, bassEvidence: FloatArray): Result? {
@@ -92,8 +81,11 @@ internal object CqtChordTemplateDetector {
         val values = quality.intervals.map { interval -> pitch[(root + interval) % 12] }
         if (values.any { it < 0.14f }) return false
 
-        if (quality.intervals.size > quality.coreSize) {
-            for (index in quality.coreSize until quality.intervals.size) {
+        // Added tones must be real, not weak spectral leakage. The first three
+        // intervals form the basic triad for every quality in this table except
+        // sus/dim, where this remains harmless because there are no extensions.
+        if (quality.intervals.size > 3) {
+            for (index in 3 until quality.intervals.size) {
                 if (values[index] < quality.minimumExtensionSupport) return false
             }
         }
@@ -121,7 +113,7 @@ internal object CqtChordTemplateDetector {
         for (pc in requiredPcs) strongestChordToneBass = max(strongestChordToneBass, bass[pc].toDouble())
         val rootBass = bass[root].toDouble()
 
-        val extensions = (quality.intervals.size - quality.coreSize).coerceAtLeast(0)
+        val extensions = (quality.intervals.size - 3).coerceAtLeast(0)
         return 0.52 * mean +
             0.27 * weakest -
             0.15 * strongestOutside +

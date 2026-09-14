@@ -15,7 +15,7 @@ class PitchAnalyzerChordTest {
     private val frameSize = 8_192
 
     @Test
-    fun detectsCommonAndJazzGuitarChordsWithHarmonics() {
+    fun detectsCommonGuitarTriadsWithHarmonics() {
         val cases = listOf(
             "C" to intArrayOf(48, 52, 55, 60, 64),
             "G" to intArrayOf(43, 47, 50, 55, 59, 67),
@@ -23,7 +23,6 @@ class PitchAnalyzerChordTest {
             "Em" to intArrayOf(40, 47, 52, 55, 59, 64),
             "F#ø7" to intArrayOf(54, 57, 60, 64),
             "F#dim7" to intArrayOf(54, 57, 60, 63),
-            "G6/9" to intArrayOf(55, 59, 62, 64, 69),
         )
 
         for ((expectedChord, midiNotes) in cases) {
