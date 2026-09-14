@@ -5,6 +5,7 @@ import com.nicos.pitchkit.BuildConfig
 import com.nicos.pitchkit.tuner.harmony.ChordRecognition
 import com.nicos.pitchkit.tuner.harmony.ChordRecognizer
 import com.nicos.pitchkit.tuner.harmony.ChordStabilizer
+import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
 import com.nicos.pitchkit.tuner.models.AudioFrame
 import java.security.MessageDigest
 
@@ -102,7 +103,21 @@ class ChordNetStreamingRecognizer(
         )
 
         val prediction = predictions[validFrames - 1]
-        val rawRecognition = prediction.displayLabel?.let {
+        val pitchEvidence = PitchClassChordReranker.cqtEvidence(
+            values = features.values,
+            frameCount = features.frameCount,
+            binCount = features.binCount,
+            fmin = plan.config.fmin,
+            binsPerOctave = plan.config.binsPerOctave,
+            logMagnitude = plan.config.logMagnitude,
+            tailFrames = 4,
+        )
+        val reranked = prediction.displayLabel?.let {
+            PitchClassChordReranker.rerank(it, pitchEvidence)
+        }
+        val finalLabel = reranked?.label ?: prediction.displayLabel
+
+        val rawRecognition = finalLabel?.let {
             ChordRecognition(
                 label = it,
                 confidence = prediction.confidence,
@@ -114,11 +129,15 @@ class ChordNetStreamingRecognizer(
             val top = prediction.alternatives.joinToString(separator = " | ") { candidate ->
                 "${candidate.displayLabel ?: candidate.rawLabel}=${"%.3f".format(candidate.confidence)}"
             }
+            val correction = reranked
+                ?.takeIf { it.changed }
+                ?.let { " correction=${prediction.displayLabel}->${it.label} pitch=${"%.3f".format(it.score)}" }
+                .orEmpty()
             Log.d(
                 "PitchKitChord",
                 "backend=ChordNet raw=${prediction.displayLabel ?: "N"} " +
                     "model=${prediction.rawLabel} conf=${"%.3f".format(prediction.confidence)} " +
-                    "top3=[$top] emitted=${emitted?.label ?: "-"}",
+                    "top3=[$top]$correction emitted=${emitted?.label ?: "-"}",
             )
         }
         return emitted
