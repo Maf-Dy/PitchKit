@@ -15,10 +15,9 @@ internal data class PitchClassRerankResult(
 /**
  * Conservative second opinion for chord spelling.
  *
- * The neural recognizer remains responsible for the broad harmonic family. This
- * helper resolves closely-related spellings from direct pitch-class evidence
- * (7 vs 6/9, dim7 vs hdim7, etc.) and one exact pitch-set ambiguity: m6 vs hdim7,
- * where low-register evidence can identify the intended root.
+ * Neural recognizers remain responsible for the broad root/triad family. This
+ * helper resolves related extensions from direct pitch-class evidence and the
+ * m6 <-> hdim7 pitch-set equivalence from low-register evidence.
  */
 internal object PitchClassChordReranker {
     private data class Quality(
@@ -46,11 +45,21 @@ internal object PitchClassChordReranker {
         Quality("maj7", Family.MAJOR, intArrayOf(0, 4, 7, 11), intArrayOf(0, 4, 7)),
         Quality("9", Family.MAJOR, intArrayOf(0, 2, 4, 7, 10), intArrayOf(0, 4, 7)),
         Quality("maj9", Family.MAJOR, intArrayOf(0, 2, 4, 7, 11), intArrayOf(0, 4, 7)),
+        Quality("11", Family.MAJOR, intArrayOf(0, 2, 4, 5, 7, 10), intArrayOf(0, 4, 7)),
+        Quality("13", Family.MAJOR, intArrayOf(0, 2, 4, 7, 9, 10), intArrayOf(0, 4, 7)),
+        Quality("maj13", Family.MAJOR, intArrayOf(0, 2, 4, 7, 9, 11), intArrayOf(0, 4, 7)),
+        Quality("7b9", Family.MAJOR, intArrayOf(0, 1, 4, 7, 10), intArrayOf(0, 4, 7)),
+        Quality("7#9", Family.MAJOR, intArrayOf(0, 3, 4, 7, 10), intArrayOf(0, 4, 7)),
+        Quality("7#11", Family.MAJOR, intArrayOf(0, 4, 6, 7, 10), intArrayOf(0, 4, 7)),
+        Quality("7b13", Family.MAJOR, intArrayOf(0, 4, 7, 8, 10), intArrayOf(0, 4, 7)),
+        Quality("9#11", Family.MAJOR, intArrayOf(0, 2, 4, 6, 7, 10), intArrayOf(0, 4, 7)),
         Quality("m", Family.MINOR, intArrayOf(0, 3, 7), intArrayOf(0, 3, 7)),
         Quality("m6", Family.MINOR, intArrayOf(0, 3, 7, 9), intArrayOf(0, 3, 7)),
         Quality("m7", Family.MINOR, intArrayOf(0, 3, 7, 10), intArrayOf(0, 3, 7)),
         Quality("m(maj7)", Family.MINOR, intArrayOf(0, 3, 7, 11), intArrayOf(0, 3, 7)),
         Quality("m9", Family.MINOR, intArrayOf(0, 2, 3, 7, 10), intArrayOf(0, 3, 7)),
+        Quality("m11", Family.MINOR, intArrayOf(0, 2, 3, 5, 7, 10), intArrayOf(0, 3, 7)),
+        Quality("m13", Family.MINOR, intArrayOf(0, 2, 3, 7, 9, 10), intArrayOf(0, 3, 7)),
         Quality("dim", Family.DIMINISHED, intArrayOf(0, 3, 6), intArrayOf(0, 3, 6)),
         Quality("dim7", Family.DIMINISHED, intArrayOf(0, 3, 6, 9), intArrayOf(0, 3, 6)),
         Quality("ø7", Family.DIMINISHED, intArrayOf(0, 3, 6, 10), intArrayOf(0, 3, 6)),
@@ -80,9 +89,6 @@ internal object PitchClassChordReranker {
         val best = candidates.maxByOrNull { score(it, parsed.rootPc, normalized) } ?: original
         val bestScore = score(best, parsed.rootPc, normalized)
 
-        // Do not rewrite a model decision on weak/marginal evidence. Requiring a
-        // real score margin is what keeps passing melody tones from becoming
-        // invented chord extensions.
         val changed = best.suffix != original.suffix &&
             bestScore >= originalScore + 0.055 &&
             requiredTonesSupported(best, parsed.rootPc, normalized)
@@ -104,10 +110,7 @@ internal object PitchClassChordReranker {
         )
     }
 
-    /**
-     * Resolve the exact pitch-set equivalence Rm6 == (R-3)ø7 from low-register
-     * evidence. This is intentionally the only cross-root rewrite supported.
-     */
+    /** Resolve the exact pitch-set equivalence Rm6 == (R-3)ø7 from bass evidence. */
     fun resolveEquivalentRoot(
         label: String,
         pitchEvidence: FloatArray,
@@ -169,7 +172,7 @@ internal object PitchClassChordReranker {
         bassWeighting = false,
     )
 
-    /** Low-register-only CQT evidence used to disambiguate m6 from hdim7 roots. */
+    /** Low-register-only CQT evidence used to disambiguate roots/inversions. */
     fun cqtBassEvidence(
         values: FloatArray,
         frameCount: Int,
@@ -263,7 +266,6 @@ internal object PitchClassChordReranker {
             ?: 0.0
 
         var value = 0.56 * mean + 0.34 * weakest - 0.18 * strongestOutside
-        // Added tones must earn their way into the spelling.
         val extensionCount = (quality.intervals.size - quality.triadIntervals.size).coerceAtLeast(0)
         value -= 0.012 * extensionCount
         return value
@@ -297,7 +299,6 @@ internal object PitchClassChordReranker {
         val rootPc = roots[rootText] ?: return null
         val remainder = label.substring(rootText.length)
 
-        // 6/9 contains a slash as part of the quality, not as an inversion marker.
         val suffix: String
         val inversion: String?
         if (remainder.startsWith("6/9")) {
@@ -319,12 +320,15 @@ internal object PitchClassChordReranker {
         return Parsed(rootText, rootPc, suffix, inversion)
     }
 
-    private fun normalize(values: FloatArray): FloatArray = normalize(DoubleArray(12) { values[it].toDouble() })
+    private fun normalize(values: FloatArray): FloatArray =
+        normalize(DoubleArray(12) { values[it].toDouble() })
 
     private fun normalize(values: DoubleArray): FloatArray {
         val peak = values.maxOrNull()?.coerceAtLeast(0.0) ?: 0.0
         if (peak <= 1e-12) return FloatArray(12)
-        return FloatArray(12) { index -> (values[index] / peak).coerceIn(0.0, 1.0).toFloat() }
+        return FloatArray(12) { index ->
+            (values[index] / peak).coerceIn(0.0, 1.0).toFloat()
+        }
     }
 
     private fun unchanged(label: String) = PitchClassRerankResult(label, false, 0.0, 0.0)
