@@ -29,10 +29,6 @@ class CremaStreamingRecognizer(
         const val INFERENCE_STRIDE_FRAMES = 2
         const val EVIDENCE_SMOOTHING_FRAMES = 3
         const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.80
-
-        val JAZZ_RESCUE_SUFFIXES = listOf(
-            "6/9", "m6", "dim7", "ø7", "m9", "9",
-        )
     }
 
     private val frontend = CremaHcqtFrontend(harmonic1PlanBytes, harmonic2PlanBytes)
@@ -137,22 +133,22 @@ class CremaStreamingRecognizer(
             pitchEvidence = gesture.pitch,
             bassEvidence = gesture.bass,
         )
-        val strongJazzDsp = dsp != null &&
-            isJazzRescueLabel(dsp.label) &&
+        val strongDsp = dsp != null &&
+            CqtChordTemplateDetector.isRescueCandidate(dsp.label) &&
             dsp.score >= 0.58 &&
             dsp.margin >= 0.022
         val useDsp = when {
             dsp == null -> false
-            modelLabel == null -> strongJazzDsp
+            modelLabel == null -> strongDsp
             dsp.label == modelLabel -> false
-            !strongJazzDsp -> false
+            !strongDsp -> false
             (prediction?.confidence ?: 0.0) >= DSP_OVERRIDE_MODEL_CONFIDENCE -> false
             else -> true
         }
 
         val finalLabel = if (useDsp) dsp!!.label else modelLabel
         val finalConfidence = if (useDsp) {
-            maxOf(prediction?.confidence ?: 0.0, dsp!!.score.coerceIn(0.0, 1.0))
+            dsp!!.score.coerceIn(0.0, 1.0)
         } else {
             prediction?.confidence ?: 0.0
         }
@@ -227,9 +223,6 @@ class CremaStreamingRecognizer(
         }
         return result
     }
-
-    private fun isJazzRescueLabel(label: String): Boolean =
-        JAZZ_RESCUE_SUFFIXES.any { suffix -> label.endsWith(suffix) }
 
     private fun logDecision(
         prediction: CremaDecodedChord?,
