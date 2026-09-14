@@ -2,10 +2,6 @@ package com.nicos.pitchkit.tuner.harmony.chordnet
 
 import kotlin.math.max
 
-/**
- * Keeps recently-heard pitch classes alive long enough for normal arpeggios to
- * form one chord gesture instead of a sequence of partial chords.
- */
 internal class LivePitchEvidenceAccumulator(
     private val decay: Float = 0.68f,
     private val activeThreshold: Float = 0.24f,
@@ -23,6 +19,7 @@ internal class LivePitchEvidenceAccumulator(
     private val pitch = FloatArray(12)
     private val bass = FloatArray(12)
     private var updates = 0
+    private var updatesSinceChange = 0
     private var stableUpdates = 0
     private var lastActiveMask = 0
 
@@ -46,12 +43,19 @@ internal class LivePitchEvidenceAccumulator(
 
         val activeMask = activeMask(currentPitch)
         val addedPitch = activeMask and lastActiveMask.inv()
-        stableUpdates = if (updates == 0 || addedPitch != 0) 0 else stableUpdates + 1
+        val changed = updates == 0 || addedPitch != 0
+        if (changed) {
+            stableUpdates = 0
+            updatesSinceChange = 0
+        } else {
+            stableUpdates++
+            updatesSinceChange++
+        }
         lastActiveMask = activeMask
         updates++
 
         val ready = updates >= minimumUpdates &&
-            (stableUpdates >= 1 || updates >= forceReadyUpdates)
+            (stableUpdates >= 1 || updatesSinceChange >= forceReadyUpdates)
         return Snapshot(
             pitch = pitch.copyOf(),
             bass = bass.copyOf(),
@@ -65,6 +69,7 @@ internal class LivePitchEvidenceAccumulator(
         pitch.fill(0f)
         bass.fill(0f)
         updates = 0
+        updatesSinceChange = 0
         stableUpdates = 0
         lastActiveMask = 0
     }
