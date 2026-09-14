@@ -30,6 +30,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.nicos.pitchkit.BuildConfig
 import com.nicos.pitchkit.tuner.harmony.ChordRecognizer
+import com.nicos.pitchkit.tuner.harmony.btc.BtcAndroidFactory
+import com.nicos.pitchkit.tuner.harmony.btc.BtcContract
+import com.nicos.pitchkit.tuner.harmony.btc.BtcStreamingRecognizer
 import com.nicos.pitchkit.tuner.harmony.chordnet.ChordNetAndroidFactory
 import com.nicos.pitchkit.tuner.harmony.chordnet.ChordNetContract
 import com.nicos.pitchkit.tuner.harmony.chordnet.ChordNetStreamingRecognizer
@@ -78,10 +81,14 @@ fun GuitarTunerListener(
     val chordNetAssetsInstalled = remember(applicationContext) {
         ChordNetAndroidFactory.assetsInstalled(applicationContext)
     }
+    val btcAssetsInstalled = remember(applicationContext) {
+        BtcAndroidFactory.liveAssetsInstalled(applicationContext)
+    }
     val selectedNeuralAssetsInstalled = when (chordEngine) {
         ChordEngine.AUTO -> cremaAssetsInstalled || chordNetAssetsInstalled
         ChordEngine.CREMA -> cremaAssetsInstalled
         ChordEngine.CHORD_NET -> chordNetAssetsInstalled
+        ChordEngine.BTC_EXPERIMENTAL -> btcAssetsInstalled
         ChordEngine.CLASSIC -> false
     }
 
@@ -94,6 +101,7 @@ fun GuitarTunerListener(
         chordEngine,
         cremaAssetsInstalled,
         chordNetAssetsInstalled,
+        btcAssetsInstalled,
         referenceA4Hz,
         preferFlats,
     ) {
@@ -147,10 +155,29 @@ fun GuitarTunerListener(
                 }
             }
 
+            fun tryBtc(): ChordRecognizer? {
+                if (!btcAssetsInstalled) {
+                    if (BuildConfig.DEBUG) Log.d("PitchKit", "BTC live assets are not installed")
+                    return null
+                }
+                return try {
+                    BtcAndroidFactory.createLiveRecognizer(
+                        context = applicationContext,
+                        referenceA4Hz = referenceA4Hz,
+                    ).also {
+                        if (BuildConfig.DEBUG) Log.d("PitchKit", "BTC experimental live recognizer loaded")
+                    }
+                } catch (error: Throwable) {
+                    Log.e("PitchKit", "BTC experimental live failed to load", error)
+                    null
+                }
+            }
+
             when (requestedSelection) {
                 ChordEngine.AUTO -> tryChordNet() ?: tryCrema()
                 ChordEngine.CREMA -> tryCrema()
                 ChordEngine.CHORD_NET -> tryChordNet()
+                ChordEngine.BTC_EXPERIMENTAL -> tryBtc()
                 ChordEngine.CLASSIC -> null
             }
         }
@@ -224,11 +251,13 @@ fun GuitarTunerListener(
             val neuralSampleRate = when (neural) {
                 is CremaStreamingRecognizer -> CremaContract.SAMPLE_RATE
                 is ChordNetStreamingRecognizer -> ChordNetContract.SAMPLE_RATE
+                is BtcStreamingRecognizer -> BtcContract.SAMPLE_RATE
                 else -> 44100
             }
             val engineBufferSize = when (neural) {
                 is CremaStreamingRecognizer -> CremaContract.HOP_LENGTH
                 is ChordNetStreamingRecognizer -> ChordNetContract.HOP_LENGTH
+                is BtcStreamingRecognizer -> BtcContract.HOP_LENGTH
                 else -> if (mode == DetectionMode.NOTE) 4096 else 8192
             }
 
