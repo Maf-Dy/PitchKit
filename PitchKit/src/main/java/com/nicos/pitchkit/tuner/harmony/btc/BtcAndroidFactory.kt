@@ -12,11 +12,43 @@ object BtcAndroidFactory {
             BtcContract.PLAN_FILE in names
     }
 
+    fun liveAssetsInstalled(context: Context): Boolean = songAssetsInstalled(context)
+
     fun createSongAnalyzer(
         context: Context,
         referenceA4Hz: Double = 440.0,
         preferFlats: Boolean = false,
     ): BtcSongAnalyzer {
+        val assets = loadAssets(context)
+        return BtcSongAnalyzer(
+            modelBytes = assets.model,
+            metadata = assets.metadata,
+            cqtPlanBytes = assets.plan,
+            referenceA4Hz = referenceA4Hz,
+            preferFlats = preferFlats,
+        )
+    }
+
+    fun createLiveRecognizer(
+        context: Context,
+        referenceA4Hz: Double = 440.0,
+    ): BtcStreamingRecognizer {
+        val assets = loadAssets(context)
+        return BtcStreamingRecognizer(
+            modelBytes = assets.model,
+            metadata = assets.metadata,
+            cqtPlanBytes = assets.plan,
+            referenceA4Hz = referenceA4Hz,
+        )
+    }
+
+    private data class Assets(
+        val model: ByteArray,
+        val metadata: BtcMetadata,
+        val plan: ByteArray,
+    )
+
+    private fun loadAssets(context: Context): Assets {
         require(songAssetsInstalled(context)) {
             "BTC assets are not installed. Run tools/fetch-btc.ps1 first."
         }
@@ -25,12 +57,10 @@ object BtcAndroidFactory {
         val model = assets.open("$prefix/${BtcContract.MODEL_FILE}").use { it.readBytes() }
         val metadataBytes = assets.open("$prefix/${BtcContract.METADATA_FILE}").use { it.readBytes() }
         val plan = assets.open("$prefix/${BtcContract.PLAN_FILE}").use { it.readBytes() }
-        return BtcSongAnalyzer(
-            modelBytes = model,
+        return Assets(
+            model = model,
             metadata = BtcMetadata.parse(metadataBytes),
-            cqtPlanBytes = plan,
-            referenceA4Hz = referenceA4Hz,
-            preferFlats = preferFlats,
+            plan = plan,
         )
     }
 }
