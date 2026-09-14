@@ -7,13 +7,18 @@ Based on upstream PitchKit 1.0.1.
 ### Correctness
 
 - Added explicit NOTE, CHORD and compatibility AUTO processing modes. Production tuner/chord screens no longer need to guess monophonic vs polyphonic input.
-- Added explicit live chord-engine selection: AUTO, Crema, ChordNet, or Classic DSP. AUTO now tries Crema, then ChordNet, then Classic DSP; a Crema load failure no longer skips the ChordNet fallback.
-- Reworked classic chord transition state so a weak or pending new candidate does not keep reporting the previous chord as live audio.
-- Removed three-frame classic chroma averaging. A new chord is evaluated from the current audio frame and temporal stability comes from explicit candidate confirmation instead of mixing old harmony into new harmony.
-- Added a shared neural `ChordStabilizer` so Crema/ChordNet transitions suppress stale labels until a new chord is confirmed.
+- Added explicit live chord-engine selection: Auto, Crema, ChordNet, BTC Experimental, or Classic DSP.
+- Auto currently prefers ChordNet, then Crema, then Classic DSP. BTC Live is experimental and is never selected automatically.
+- Added a shared temporal chord-gesture accumulator for ChordNet, Crema and BTC Live. Notes from a normal arpeggio remain active long enough to form one harmony while simultaneous stable chords can resolve earlier.
+- The gesture accumulator has a bounded formation window and resets its decision timing when a new pitch arrives after a settled chord.
+- Added direct pitch-class and bass evidence to neural live decisions, including conservative DSP rescue for complex chord qualities.
+- Expanded shared pitch-content refinement through 6/9, 9/11/13 families and common altered dominants while retaining evidence thresholds to avoid inventing extensions from weak harmonics.
+- Reworked Classic DSP scoring and vocabulary to cover 6/9, 9/11/13, diminished/half-diminished and common altered dominant families.
+- Added a shared neural `ChordStabilizer` so neural transitions suppress stale labels until a new chord is confirmed.
 - Added detector confidence and backend identity to `TuningResult.Chord`.
-- Added debug `PitchKitChord` traces showing raw neural/decoder prediction, confidence and the stabilized chord actually emitted. This distinguishes model/decoder mistakes from wrapper/state mistakes during real microphone tests.
-- Silence now resets chord state after sustained quiet rather than leaking stale recognition state.
+- Added debug `PitchKitChord` traces showing raw model prediction, confidence, alternatives, gesture state, corrections and emitted chord.
+- Silence resets chord state after sustained quiet rather than leaking stale recognition state.
+- Neural recognizer close/reset paths are synchronized so engine switching cannot close an ONNX session while that recognizer is still executing inference.
 
 ### Performance
 
@@ -24,35 +29,57 @@ Based on upstream PitchKit 1.0.1.
 - Removed per-template chord `HashSet` allocation by precomputing pitch masks.
 - Removed classic pitch-class `MutableList`, `Pair` and sorting churn by using reusable fixed arrays.
 - Reused large classic FFT work arrays per DSP thread instead of allocating real/imaginary/magnitude arrays every chord frame.
-- Explicit CHORD mode performs one classic FFT path; the compatibility AUTO mode may still do extra routing work and is not used by Modern Pitch Tuner.
+- Explicit CHORD mode performs one classic FFT path; compatibility AUTO mode may still do extra routing work and is not used by Modern Pitch Tuner.
 
 ### Lifecycle
 
-- Microphone collection now runs only while the host lifecycle is `RESUMED`.
+- Microphone collection runs only while the host lifecycle is `RESUMED`.
 - `AudioRecord` is stopped and released when collection is cancelled below `RESUMED`.
 - Engine stop is restartable; permanent close is reserved for disposal.
+- Neural recognizers are tied to the requested engine selection so stale ChordNet/Crema/BTC instances are not reused after an engine change.
 
-### Harmony backends
+### Live harmony backends
 
 - Added pluggable `ChordRecognizer` API.
-- Added ChordNet 2E1D ONNX runtime integration.
-- Added Crema 0.2.0 ONNX runtime integration with HCQT frontend and multi-head harmony decoder.
+- Added ChordNet 2E1D ONNX runtime integration with temporal CQT/DSP fusion.
+- Added Crema 0.2.0 ONNX runtime integration with HCQT frontend, chord-tag/root/pitch/bass decoding and the same temporal gesture layer.
+- Added explicit BTC Live Experimental using the already-pinned BTC checkpoint. It pads unavailable context into the model's native 108-frame bidirectional window and logs the amount of real context used. It remains benchmark-only until phone latency and accuracy justify keeping it.
+- Classic DSP remains an independent non-neural fallback/reference path rather than being folded into the neural implementation.
+
+### Offline harmony backends
+
 - Added shared offline-song timeline models and repeated-section grouping.
-- Added Crema whole-song analysis with sequence-level Viterbi decoding.
-- Ported the LV-Chordia / LV Song large-vocabulary five-model ensemble as an offline comparison backend. It is retained for comparison because its prior real-song result was not accurate enough for the app's needs.
-- Added an experimental BTC whole-song backend based on the newer ChordMini continual-learning BTC checkpoint. The Android path uses 22.05 kHz audio, 144-bin log-CQT, overlapping 108-frame windows, logit aggregation, Gaussian smoothing, categorical smoothing, and minimum segment-duration cleanup.
-- BTC export metadata records the exact source commit, checkpoint Git blob SHA, generated ONNX SHA-256, and checkpoint normalization mean/std so the Android frontend cannot silently drift from the exported model.
-- Restored deterministic tests for note mapping, stereo-to-mono conversion, classic synthetic guitar chords, ChordNet vocabulary/post-processing and Crema harmony decoding.
-- Added regression tests specifically for stale chord transitions and bounded YIN pitch accuracy.
-- Added tests for BTC export metadata validation and shared song-section grouping.
+- `SongChordSegment` now has optional root, bass, pitch-class and alternative-interpretation fields so future learning/instrument-visualization UI can reuse analysis results without re-running audio.
+- LV Song currently remains the strongest offline engine in this project's real-song tests. It keeps the five-model large-vocabulary sequence decoder, separates bass from mid/upper harmony evidence, weights persistent pitches over transient peaks, and refines compatible candidates using the full LV dictionary rather than a small hand-written quality list.
+- Crema whole-song Viterbi now fuses chord-tag, root and pitch-content heads instead of discarding the root/pitch outputs; segment results retain root, bass and persistent pitch classes.
+- BTC whole-song analysis retains the ChordMini recommended overlap/smoothing path and now verifies each stable segment against the same full-song CQT evidence, retaining root/pitch information for downstream use.
+- Added Consonance Decomposed as a fourth explicit offline benchmark engine. Its Conformer predicts root, bass and twelve pitch activations separately from a 144-bin linear CQT and preserves arbitrary pitch-set information instead of forcing every frame into a small fixed chord vocabulary.
+- Added `HarmonyBenchmarkEvaluator` to compare all offline engines at the same annotated intervals using independent label, root, bass and pitch-set metrics. Multiple accepted spellings are supported for genuinely ambiguous complex harmony.
+
+### Reproducibility
+
+- BTC export metadata records the exact source commit, checkpoint Git blob SHA, generated ONNX SHA-256, and checkpoint normalization mean/std.
+- LV Song model/front-end assets and full dictionary are pinned/generated by the existing LV export scripts.
+- Consonance tooling pins source commit `d17633aea4e68e616e735d09df97b97ae3428e71`, verifies checkpoint size/blob identity, exports only the inference graph, and generates a dedicated linear-magnitude Android CQT plan.
+- Generated neural assets remain uncommitted and are verified at runtime/export time.
+
+### Tests added or extended
+
+- Synthetic Classic tests cover major/minor, half-diminished, diminished seventh and G6/9.
+- Live gesture tests cover normal arpeggio formation, simultaneous-chord fast resolution, bounded formation time, and a new pitch after a settled chord.
+- ChordNet/Crema diagnostics expose top alternatives for real-device debugging.
+- Consonance decoder tests cover G6/9, F#ø7 and F#dim7.
+- LV Song full-dictionary refinement tests distinguish G6/9 from a real G7.
+- Shared benchmark tests cover label aliases/enharmonics plus root/bass/pitch-set scoring.
 
 ### Deliberately not claimed as solved yet
 
-- The minimum neural confidence cutoff is not being raised arbitrarily. Confidence is now observable, so it should be calibrated against recorded/labelled guitar tests before changing the acceptance threshold.
-- Crema HCQT generation is still the dominant cost in neural chord mode and remains a separate performance target.
-- Repeated strums of the same chord are not separate chord identities. A future practice/training mode still needs onset/strum detection if it must count `C` -> `C` -> `C` as three events.
-- BTC is a new candidate, not a claimed accuracy win. Its ONNX export/runtime path still needs local model export plus the same problematic song used to reject LV Song before BTC can be accepted as the production offline analyzer.
-- LV Song remains available only as an offline comparison backend; its previous whole-song result was reported inaccurate and is not treated as the preferred analyzer.
+- No neural engine is declared the final live winner until ChordNet, Crema and BTC Experimental are tested on-device with the same simultaneous/fast-arpeggio/medium-arpeggio/slow-arpeggio/reordered-note matrix.
+- BTC Live may prove unsuitable because the checkpoint's native bidirectional context is much longer than a low-latency live gesture. It remains explicitly experimental.
+- Consonance ONNX export and Android execution still require a local asset-generation/build run; this changelog does not claim those binaries have been successfully generated on the user's machine yet.
+- Complex Anomalie/Jacob Collier-style harmony is not claimed to be perfectly solvable from a dense finished mix. The benchmark separates note/root understanding from exact chord-symbol agreement so improvements are measurable rather than anecdotal.
+- Crema HCQT generation remains a major live compute cost and still needs phone profiling.
+- Model/checkpoint/training-data provenance must be reviewed before a production/commercial distribution decision.
 
 ### Maintenance
 
