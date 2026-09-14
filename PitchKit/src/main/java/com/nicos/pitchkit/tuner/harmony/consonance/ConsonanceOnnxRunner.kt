@@ -39,12 +39,13 @@ internal class ConsonanceOnnxRunner(
         }
     }
 
-    /** Input is feature-major [bin,time], matching [1,1,144,time]. */
+    /** Input is fixed feature-major [144,862], matching ONNX [1,1,144,862]. */
     @Synchronized
-    fun infer(featureMajor: FloatArray, frameCount: Int): ConsonanceHeads {
-        require(frameCount > 0)
-        require(featureMajor.size == ConsonanceContract.INPUT_BINS * frameCount) {
-            "Expected ${ConsonanceContract.INPUT_BINS * frameCount} Consonance values, got ${featureMajor.size}"
+    fun infer(featureMajor: FloatArray): ConsonanceHeads {
+        val frames = ConsonanceContract.SEQUENCE_FRAMES
+        val expected = ConsonanceContract.INPUT_BINS * frames
+        require(featureMajor.size == expected) {
+            "Expected $expected Consonance values for fixed ${frames}-frame input, got ${featureMajor.size}"
         }
 
         OnnxTensor.createTensor(
@@ -54,28 +55,28 @@ internal class ConsonanceOnnxRunner(
                 1,
                 1,
                 ConsonanceContract.INPUT_BINS.toLong(),
-                frameCount.toLong(),
+                frames.toLong(),
             ),
         ).use { input ->
             session.run(mapOf(ConsonanceContract.INPUT_NAME to input)).use { result ->
                 return ConsonanceHeads(
-                    frames = frameCount,
+                    frames = frames,
                     root = readOutput(
                         result,
                         ConsonanceContract.ROOT_OUTPUT,
-                        frameCount,
+                        frames,
                         ConsonanceContract.ROOT_COUNT,
                     ),
                     bass = readOutput(
                         result,
                         ConsonanceContract.BASS_OUTPUT,
-                        frameCount,
+                        frames,
                         ConsonanceContract.BASS_COUNT,
                     ),
                     pitch = readOutput(
                         result,
                         ConsonanceContract.CHORD_OUTPUT,
-                        frameCount,
+                        frames,
                         ConsonanceContract.PITCH_COUNT,
                     ),
                 )
