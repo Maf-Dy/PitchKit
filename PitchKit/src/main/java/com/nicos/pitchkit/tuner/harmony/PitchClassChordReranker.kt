@@ -15,10 +15,10 @@ internal data class PitchClassRerankResult(
 /**
  * Conservative second opinion for chord spelling.
  *
- * The neural recognizer remains responsible for the root/triad family. This
- * helper only resolves closely-related spellings from direct pitch-class
- * evidence (7 vs 6/9, dim7 vs hdim7, etc.). A minor/diminished family switch is
- * allowed only when the fifth evidence clearly supports it.
+ * The neural recognizer remains responsible for the broad harmonic family. This
+ * helper resolves closely-related spellings from direct pitch-class evidence
+ * (7 vs 6/9, dim7 vs hdim7, etc.) and one exact pitch-set ambiguity: m6 vs hdim7,
+ * where low-register evidence can identify the intended root.
  */
 internal object PitchClassChordReranker {
     private data class Quality(
@@ -35,6 +35,8 @@ internal object PitchClassChordReranker {
         "E" to 4, "F" to 5, "F#" to 6, "Gb" to 6, "G" to 7,
         "G#" to 8, "Ab" to 8, "A" to 9, "A#" to 10, "Bb" to 10, "B" to 11,
     )
+    private val sharpNames = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+    private val flatNames = arrayOf("C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B")
 
     private val qualities = listOf(
         Quality("", Family.MAJOR, intArrayOf(0, 4, 7), intArrayOf(0, 4, 7)),
@@ -102,6 +104,50 @@ internal object PitchClassChordReranker {
         )
     }
 
+    /**
+     * Resolve the exact pitch-set equivalence Rm6 == (R-3)ø7 from low-register
+     * evidence. This is intentionally the only cross-root rewrite supported.
+     */
+    fun resolveEquivalentRoot(
+        label: String,
+        pitchEvidence: FloatArray,
+        bassEvidence: FloatArray,
+    ): PitchClassRerankResult {
+        require(pitchEvidence.size == 12)
+        require(bassEvidence.size == 12)
+        val parsed = parse(label) ?: return unchanged(label)
+        if (parsed.inversion != null) return unchanged(label)
+        if (parsed.suffix != "m6" && parsed.suffix != "ø7") return unchanged(label)
+
+        val targetRoot = if (parsed.suffix == "m6") {
+            floorMod12(parsed.rootPc - 3)
+        } else {
+            floorMod12(parsed.rootPc + 3)
+        }
+        val targetSuffix = if (parsed.suffix == "m6") "ø7" else "m6"
+        val targetQuality = qualities.first { it.suffix == targetSuffix }
+        val normalizedPitch = normalize(pitchEvidence)
+        val normalizedBass = normalize(bassEvidence)
+
+        if (!requiredTonesSupported(targetQuality, targetRoot, normalizedPitch)) {
+            return unchanged(label)
+        }
+
+        val currentBass = normalizedBass[parsed.rootPc].toDouble()
+        val targetBass = normalizedBass[targetRoot].toDouble()
+        val switch = targetBass >= 0.32 && targetBass >= currentBass + 0.12
+        if (!switch) return unchanged(label)
+
+        val useFlats = parsed.rootText.contains('b')
+        val targetRootText = if (useFlats) flatNames[targetRoot] else sharpNames[targetRoot]
+        return PitchClassRerankResult(
+            label = targetRootText + targetSuffix,
+            changed = true,
+            originalScore = currentBass,
+            score = targetBass,
+        )
+    }
+
     /** Fold CQT bins into 12 pitch classes over the newest frames. */
     fun cqtEvidence(
         values: FloatArray,
@@ -111,6 +157,50 @@ internal object PitchClassChordReranker {
         binsPerOctave: Int,
         logMagnitude: Boolean,
         tailFrames: Int = 4,
+    ): FloatArray = foldCqt(
+        values = values,
+        frameCount = frameCount,
+        binCount = binCount,
+        fmin = fmin,
+        binsPerOctave = binsPerOctave,
+        logMagnitude = logMagnitude,
+        tailFrames = tailFrames,
+        maxFrequencyHz = Double.POSITIVE_INFINITY,
+        bassWeighting = false,
+    )
+
+    /** Low-register-only CQT evidence used to disambiguate m6 from hdim7 roots. */
+    fun cqtBassEvidence(
+        values: FloatArray,
+        frameCount: Int,
+        binCount: Int,
+        fmin: Double,
+        binsPerOctave: Int,
+        logMagnitude: Boolean,
+        tailFrames: Int = 4,
+        maxFrequencyHz: Double = 420.0,
+    ): FloatArray = foldCqt(
+        values = values,
+        frameCount = frameCount,
+        binCount = binCount,
+        fmin = fmin,
+        binsPerOctave = binsPerOctave,
+        logMagnitude = logMagnitude,
+        tailFrames = tailFrames,
+        maxFrequencyHz = maxFrequencyHz,
+        bassWeighting = true,
+    )
+
+    private fun foldCqt(
+        values: FloatArray,
+        frameCount: Int,
+        binCount: Int,
+        fmin: Double,
+        binsPerOctave: Int,
+        logMagnitude: Boolean,
+        tailFrames: Int,
+        maxFrequencyHz: Double,
+        bassWeighting: Boolean,
     ): FloatArray {
         if (frameCount <= 0 || binCount <= 0 || values.size < frameCount * binCount) {
             return FloatArray(12)
@@ -121,6 +211,7 @@ internal object PitchClassChordReranker {
             val offset = frame * binCount
             for (bin in 0 until binCount) {
                 val frequency = fmin * 2.0.pow(bin.toDouble() / binsPerOctave.toDouble())
+                if (frequency > maxFrequencyHz) continue
                 val midi = (69.0 + 12.0 * log2(frequency / 440.0)).roundToInt()
                 val pitchClass = floorMod12(midi)
                 val raw = values[offset + bin].toDouble()
@@ -129,9 +220,13 @@ internal object PitchClassChordReranker {
                 } else {
                     raw.coerceAtLeast(0.0)
                 }
-                // Compression prevents one bass fundamental from completely
-                // hiding upper chord tones.
-                result[pitchClass] += sqrt(magnitude.coerceAtLeast(0.0))
+                val compressed = sqrt(magnitude.coerceAtLeast(0.0))
+                val weight = if (bassWeighting) {
+                    sqrt((fmin / frequency).coerceAtMost(1.0))
+                } else {
+                    1.0
+                }
+                result[pitchClass] += compressed * weight
             }
         }
         return normalize(result)
