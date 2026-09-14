@@ -12,9 +12,9 @@ import kotlin.math.pow
  * Polyphonic chord detector built around note-fundamental salience rather than
  * directly folding every FFT peak into chroma.
  *
- * Temporal stability is handled by candidate confirmation, not by averaging old
- * chroma frames into new audio. This prevents a previous C frame from polluting
- * the first G frames during a real C -> G transition.
+ * Classic deliberately stays an independent-frame DSP fallback. Richer
+ * extensions are supported, but they must have direct spectral evidence so the
+ * detector does not invent jazz extensions from passing harmonics.
  */
 internal class ChordDetector(
     private val sampleRate: Int,
@@ -26,6 +26,7 @@ internal class ChordDetector(
         val suffix: String,
         val pitches: IntArray,
         val pitchMask: Int,
+        val coreSize: Int = 3,
     )
 
     private data class PitchProfile(
@@ -47,8 +48,6 @@ internal class ChordDetector(
     private val minMidi = floor(midiForFrequency(profile.minFreq)).toInt() - 1
     private val maxMidi = ceil(midiForFrequency(maxFundamental)).toInt() + 1
 
-    // Reused per-frame scoring storage. The original implementation built twelve
-    // MutableLists, many Pair objects, and sorted every pitch-class list per frame.
     private val topPitchClassScore = DoubleArray(12)
     private val secondPitchClassScore = DoubleArray(12)
     private val chromaScratch = DoubleArray(12)
@@ -107,7 +106,6 @@ internal class ChordDetector(
             pendingCount = 1
         }
 
-        // Never claim the old chord while a different candidate is pending.
         if (pendingCount < 2) return null
 
         currentChord = candidate
@@ -199,8 +197,7 @@ internal class ChordDetector(
         for (harmonic in 2..6) {
             val harmonicHz = fundamentalHz * harmonic
             if (harmonicHz > profile.maxFreq) break
-            support += harmonicWeights[harmonic] *
-                compressedPeakNear(magnitudes, fftSize, harmonicHz)
+            support += harmonicWeights[harmonic] * compressedPeakNear(magnitudes, fftSize, harmonicHz)
         }
 
         var leakage = 0.0
@@ -301,11 +298,19 @@ internal class ChordDetector(
             }
         }
 
-        if (template.pitches.size == 4) {
-            val extension = template.pitches.last()
-            if (chroma[extension] < 0.20) score -= 0.12
-            else score += 0.025
-            score -= 0.02
+        val extensionCount = (template.pitches.size - template.coreSize).coerceAtLeast(0)
+        if (extensionCount > 0) {
+            var coreMean = 0.0
+            for (index in 0 until template.coreSize.coerceAtMost(template.pitches.size)) {
+                coreMean += chroma[template.pitches[index]]
+            }
+            coreMean /= template.coreSize.coerceAtMost(template.pitches.size).coerceAtLeast(1)
+            val extensionThreshold = max(0.18, coreMean * 0.28)
+            for (index in template.coreSize until template.pitches.size) {
+                val support = chroma[template.pitches[index]]
+                score += if (support >= extensionThreshold) 0.022 else -0.105
+            }
+            score -= 0.012 * extensionCount
         }
 
         if (template.suffix == "sus2" || template.suffix == "sus4") {
@@ -333,6 +338,20 @@ internal class ChordDetector(
             "6" to intArrayOf(0, 4, 7, 9),
             "m6" to intArrayOf(0, 3, 7, 9),
             "m(maj7)" to intArrayOf(0, 3, 7, 11),
+            "6/9" to intArrayOf(0, 4, 7, 2, 9),
+            "9" to intArrayOf(0, 4, 7, 10, 2),
+            "maj9" to intArrayOf(0, 4, 7, 11, 2),
+            "m9" to intArrayOf(0, 3, 7, 10, 2),
+            "11" to intArrayOf(0, 4, 7, 10, 2, 5),
+            "m11" to intArrayOf(0, 3, 7, 10, 2, 5),
+            "13" to intArrayOf(0, 4, 7, 10, 2, 9),
+            "maj13" to intArrayOf(0, 4, 7, 11, 2, 9),
+            "m13" to intArrayOf(0, 3, 7, 10, 2, 9),
+            "7b9" to intArrayOf(0, 4, 7, 10, 1),
+            "7#9" to intArrayOf(0, 4, 7, 10, 3),
+            "7#11" to intArrayOf(0, 4, 7, 10, 6),
+            "7b13" to intArrayOf(0, 4, 7, 10, 8),
+            "9#11" to intArrayOf(0, 4, 7, 10, 2, 6),
             "dim7" to intArrayOf(0, 3, 6, 9),
             "ø7" to intArrayOf(0, 3, 6, 10),
             "sus2" to intArrayOf(0, 2, 7),
