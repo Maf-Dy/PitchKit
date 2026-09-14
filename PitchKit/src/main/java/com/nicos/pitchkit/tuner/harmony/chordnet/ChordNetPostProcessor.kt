@@ -24,6 +24,7 @@ object ChordNetPostProcessor {
         windowCount: Int,
         validFrameCount: Int,
         smoothingKernel: Int = ChordNetContract.SMOOTHING_KERNEL,
+        includeAlternatives: Boolean = false,
     ): List<FramePrediction> {
         require(windowCount > 0)
         require(smoothingKernel > 0 && smoothingKernel % 2 == 1) {
@@ -51,8 +52,11 @@ object ChordNetPostProcessor {
                 smoothed[chord] = smoothed[chord] / divisor
             }
 
-            val topIndices = topIndices(smoothed, 3)
-            val bestIndex = topIndices.first()
+            var bestIndex = 0
+            for (chord in 1 until smoothed.size) {
+                if (smoothed[chord] > smoothed[bestIndex]) bestIndex = chord
+            }
+
             val maxLogit = smoothed[bestIndex]
             var denominator = 0.0
             for (value in smoothed) denominator += exp(value - maxLogit)
@@ -61,20 +65,26 @@ object ChordNetPostProcessor {
             fun probability(index: Int): Double =
                 exp(smoothed[index] - maxLogit) / safeDenominator
 
-            FramePrediction(
-                frameIndex = frame,
-                labelIndex = bestIndex,
-                rawLabel = ChordNetVocabulary.labelAt(bestIndex),
-                displayLabel = ChordNetVocabulary.displayLabel(bestIndex),
-                confidence = probability(bestIndex),
-                alternatives = topIndices.map { index ->
+            val alternatives = if (includeAlternatives) {
+                topIndices(smoothed, 3).map { index ->
                     CandidatePrediction(
                         labelIndex = index,
                         rawLabel = ChordNetVocabulary.labelAt(index),
                         displayLabel = ChordNetVocabulary.displayLabel(index),
                         confidence = probability(index),
                     )
-                },
+                }
+            } else {
+                emptyList()
+            }
+
+            FramePrediction(
+                frameIndex = frame,
+                labelIndex = bestIndex,
+                rawLabel = ChordNetVocabulary.labelAt(bestIndex),
+                displayLabel = ChordNetVocabulary.displayLabel(bestIndex),
+                confidence = probability(bestIndex),
+                alternatives = alternatives,
             )
         }
     }
