@@ -27,6 +27,9 @@ class LvChordiaSongAnalyzer internal constructor(
         const val MODEL_OVERLAP_FRAMES = 64
         const val MODEL_HALF_OVERLAP = MODEL_OVERLAP_FRAMES / 2
         const val MODEL_STEP_FRAMES = MODEL_WINDOW_FRAMES - MODEL_OVERLAP_FRAMES
+        const val HARMONY_PRESENCE_THRESHOLD = 0.28f
+        const val HARMONY_MEAN_WEIGHT = 0.65
+        const val HARMONY_PERSISTENCE_WEIGHT = 0.35
     }
 
     private data class DiagnosticSegment(
@@ -215,7 +218,7 @@ class LvChordiaSongAnalyzer internal constructor(
                     .coerceIn(firstSourceFrame.toLong(), (chromaFrameCount - 1).toLong())
                     .toInt()
                 val frameRange = firstSourceFrame..lastSourceFrame
-                val harmonyEvidence = PitchClassChordReranker.averageEvidence(
+                val harmonyEvidence = persistentHarmonyEvidence(
                     chroma = harmonyChroma,
                     frameCount = chromaFrameCount,
                     frameIndices = frameRange,
@@ -253,6 +256,43 @@ class LvChordiaSongAnalyzer internal constructor(
             start = end
         }
         return result
+    }
+
+    private fun persistentHarmonyEvidence(
+        chroma: FloatArray,
+        frameCount: Int,
+        frameIndices: IntRange,
+    ): FloatArray {
+        if (frameCount <= 0 || chroma.size < frameCount * 12) return FloatArray(12)
+        val first = frameIndices.first.coerceIn(0, frameCount - 1)
+        val last = frameIndices.last.coerceIn(first, frameCount - 1)
+        val count = last - first + 1
+        if (count <= 3) {
+            return PitchClassChordReranker.averageEvidence(chroma, frameCount, first..last)
+        }
+
+        val mean = DoubleArray(12)
+        val present = IntArray(12)
+        for (frame in first..last) {
+            val offset = frame * 12
+            for (pc in 0 until 12) {
+                val value = chroma[offset + pc].coerceIn(0f, 1f)
+                mean[pc] += value
+                if (value >= HARMONY_PRESENCE_THRESHOLD) present[pc]++
+            }
+        }
+
+        val combined = DoubleArray(12)
+        for (pc in 0 until 12) {
+            val average = mean[pc] / count.toDouble()
+            val persistence = present[pc].toDouble() / count.toDouble()
+            combined[pc] = HARMONY_MEAN_WEIGHT * average +
+                HARMONY_PERSISTENCE_WEIGHT * persistence
+        }
+
+        val peak = combined.maxOrNull()?.coerceAtLeast(0.0) ?: 0.0
+        if (peak <= 1e-12) return FloatArray(12)
+        return FloatArray(12) { pc -> (combined[pc] / peak).coerceIn(0.0, 1.0).toFloat() }
     }
 
     private fun pitchSummary(evidence: FloatArray): String {
