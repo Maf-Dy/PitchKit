@@ -87,25 +87,28 @@ class ConsonanceSongAnalyzer internal constructor(
             normalizePeakInPlace(chunk, actualSamples)
 
             val features = frontend.transform(chunk)
-            if (features.frameCount > 0) {
-                val featureMajor = transposeFrameMajorToFeatureMajor(
-                    features.values,
-                    features.frameCount,
-                    features.binCount,
-                )
-                val heads = runner.infer(featureMajor, features.frameCount)
-                val decoded = decoder.decode(heads)
-                val chunkStartMs = chunkStartSample * 1000L / ConsonanceContract.SAMPLE_RATE
-                val actualEndMs = (chunkStartSample + actualSamples) * 1000L /
-                    ConsonanceContract.SAMPLE_RATE
+            require(features.frameCount == ConsonanceContract.SEQUENCE_FRAMES) {
+                "Consonance CQT produced ${features.frameCount} frames for a " +
+                    "${ConsonanceContract.CHUNK_SECONDS}s chunk; expected " +
+                    "${ConsonanceContract.SEQUENCE_FRAMES}. Regenerate Consonance assets/frontend together."
+            }
+            val featureMajor = transposeFrameMajorToFeatureMajor(
+                features.values,
+                features.frameCount,
+                features.binCount,
+            )
+            val heads = runner.infer(featureMajor)
+            val decoded = decoder.decode(heads)
+            val chunkStartMs = chunkStartSample * 1000L / ConsonanceContract.SAMPLE_RATE
+            val actualEndMs = (chunkStartSample + actualSamples) * 1000L /
+                ConsonanceContract.SAMPLE_RATE
 
-                for (frameIndex in decoded.indices) {
-                    val frameMs = chunkStartMs +
-                        frameIndex.toLong() * ConsonanceContract.HOP_LENGTH * 1000L /
-                        ConsonanceContract.SAMPLE_RATE
-                    if (frameMs >= actualEndMs || frameMs >= finalDuration) break
-                    frames += TimedFrame(frameMs, decoded[frameIndex])
-                }
+            for (frameIndex in decoded.indices) {
+                val frameMs = chunkStartMs +
+                    frameIndex.toLong() * ConsonanceContract.HOP_LENGTH * 1000L /
+                    ConsonanceContract.SAMPLE_RATE
+                if (frameMs >= actualEndMs || frameMs >= finalDuration) break
+                frames += TimedFrame(frameMs, decoded[frameIndex])
             }
             chunkStartSample += actualSamples
         }
