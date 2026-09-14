@@ -46,7 +46,10 @@ object ChordNetPostProcessor {
                     smoothed[chord] += logits[offset + chord].toDouble()
                 }
             }
-            for (chord in smoothed.indices) smoothed[chord] /= count
+            val divisor = count.toDouble()
+            for (chord in smoothed.indices) {
+                smoothed[chord] = smoothed[chord] / divisor
+            }
 
             val topIndices = topIndices(smoothed, 3)
             val bestIndex = topIndices.first()
