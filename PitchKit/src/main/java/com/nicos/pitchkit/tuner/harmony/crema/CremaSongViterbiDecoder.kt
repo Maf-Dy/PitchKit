@@ -88,17 +88,45 @@ internal class CremaSongViterbiDecoder(
             path[time - 1] = if (predecessor >= 0) predecessor else path[time]
         }
 
-        return List(timeCount) { time ->
-            val stateIndex = path[time]
-            Prediction(
-                frame = observations[time].frame,
-                label = displayLabel(state.labels[stateIndex], observations[time].bass),
-                confidence = observations[time].tag[stateIndex].toDouble().coerceIn(0.0, 1.0),
-            )
+        val result = MutableList<Prediction?>(timeCount) { null }
+        var segmentStart = 0
+        while (segmentStart < timeCount) {
+            val stateIndex = path[segmentStart]
+            var segmentEnd = segmentStart + 1
+            while (segmentEnd < timeCount && path[segmentEnd] == stateIndex) segmentEnd++
+
+            val raw = state.labels[stateIndex]
+            // Crema's reference implementation estimates inversion over the
+            // complete decoded chord segment using a geometric mean of bass
+            // probabilities, not independently on each frame.
+            val bassPc = segmentBassPitchClass(segmentStart, segmentEnd)
+            val rendered = displayLabel(raw, bassPc)
+            for (time in segmentStart until segmentEnd) {
+                result[time] = Prediction(
+                    frame = observations[time].frame,
+                    label = rendered,
+                    confidence = observations[time].tag[stateIndex].toDouble().coerceIn(0.0, 1.0),
+                )
+            }
+            segmentStart = segmentEnd
         }
+
+        return result.map { requireNotNull(it) }
     }
 
-    private fun displayLabel(raw: String, bass: FloatArray): String? {
+    private fun segmentBassPitchClass(start: Int, endExclusive: Int): Int? {
+        if (start !in observations.indices || endExclusive <= start) return null
+        val scores = DoubleArray(12)
+        for (time in start until endExclusive.coerceAtMost(observations.size)) {
+            val bass = observations[time].bass
+            for (pc in 0 until minOf(12, bass.size)) {
+                scores[pc] += ln(bass[pc].toDouble().coerceAtLeast(EPSILON))
+            }
+        }
+        return scores.indices.maxByOrNull { scores[it] }
+    }
+
+    private fun displayLabel(raw: String, bassPc: Int?): String? {
         if (raw == "N" || raw == "X") return null
         val separator = raw.indexOf(':')
         if (separator <= 0) return null
@@ -108,8 +136,8 @@ internal class CremaSongViterbiDecoder(
         val chordTones = QUALITY_INTERVALS[quality] ?: return null
         if (rootPc < 0) return null
 
-        val bassPc = (0 until minOf(12, bass.size)).maxByOrNull { bass[it] } ?: rootPc
-        val relativeBass = (bassPc - rootPc + 12) % 12
+        val resolvedBass = bassPc ?: rootPc
+        val relativeBass = (resolvedBass - rootPc + 12) % 12
         val validInversion = relativeBass != 0 && chordTones.contains(relativeBass)
 
         return buildString {
@@ -117,7 +145,7 @@ internal class CremaSongViterbiDecoder(
             append(displayQuality(quality))
             if (validInversion) {
                 append('/')
-                append(noteName(bassPc))
+                append(noteName(resolvedBass))
             }
         }
     }
