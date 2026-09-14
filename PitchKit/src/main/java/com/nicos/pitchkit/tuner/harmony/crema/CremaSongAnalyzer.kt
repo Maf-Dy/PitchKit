@@ -7,10 +7,7 @@ import com.nicos.pitchkit.tuner.harmony.song.SongSectionDetector
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Whole-song Crema analyzer. PCM is accepted incrementally and decoded once at
- * the end with Crema's transition statistics instead of the live heuristic.
- */
+/** Whole-song Crema analyzer using fused structured-head Viterbi decoding. */
 class CremaSongAnalyzer internal constructor(
     modelBytes: ByteArray,
     runtimeStateJson: String,
@@ -30,10 +27,7 @@ class CremaSongAnalyzer internal constructor(
     private val frontend = CremaHcqtFrontend(harmonic1PlanBytes, harmonic2PlanBytes)
     private val runner = CremaOnnxRunner(modelBytes)
     private val runtimeState = CremaRuntimeState.parse(runtimeStateJson)
-    private val sequenceDecoder = CremaSongViterbiDecoder(
-        state = runtimeState,
-        preferFlats = preferFlats,
-    )
+    private val sequenceDecoder = CremaSongViterbiDecoder(runtimeState, preferFlats)
     private val resampler = StreamingPcmResampler(
         targetRate = CremaContract.SAMPLE_RATE,
         pitchScale = 440.0 / referenceA4Hz,
@@ -57,7 +51,6 @@ class CremaSongAnalyzer internal constructor(
         check(!closed) { "CremaSongAnalyzer is closed" }
         check(!finished) { "CremaSongAnalyzer has already finished" }
         if (samples.isEmpty()) return
-
         val target = resampler.process(samples, sampleRate)
         if (target.isEmpty()) return
         totalTargetSamples += target.size
@@ -66,10 +59,7 @@ class CremaSongAnalyzer internal constructor(
         val windowSamples = WINDOW_FRAMES * CremaContract.HOP_LENGTH
         val stepSamples = STEP_FRAMES * CremaContract.HOP_LENGTH
         while (buffer.size >= windowSamples) {
-            analyzeWindow(
-                audio = buffer.copyFirst(windowSamples),
-                finalWindow = false,
-            )
+            analyzeWindow(buffer.copyFirst(windowSamples), finalWindow = false)
             buffer.dropFirst(stepSamples)
             windowStartFrame += STEP_FRAMES
         }
@@ -83,16 +73,15 @@ class CremaSongAnalyzer internal constructor(
             val remainingFrames = buffer.size / CremaContract.HOP_LENGTH
             if (remainingFrames >= MIN_FINAL_FRAMES) {
                 analyzeWindow(
-                    audio = buffer.copyFirst(remainingFrames * CremaContract.HOP_LENGTH),
+                    buffer.copyFirst(remainingFrames * CremaContract.HOP_LENGTH),
                     finalWindow = true,
                 )
             }
             finished = true
         }
 
-        val inferredDuration = (
-            totalTargetSamples * 1000L / CremaContract.SAMPLE_RATE
-        ).coerceAtLeast(0L)
+        val inferredDuration = (totalTargetSamples * 1000L / CremaContract.SAMPLE_RATE)
+            .coerceAtLeast(0L)
         val finalDuration = max(durationMs, inferredDuration)
         val chords = buildChordSegments(finalDuration)
         return SongHarmonyAnalysis(
@@ -116,11 +105,7 @@ class CremaSongAnalyzer internal constructor(
         if (commitStart >= commitEnd) return
 
         for (localFrame in commitStart until commitEnd) {
-            sequenceDecoder.add(
-                heads = heads,
-                localFrame = localFrame,
-                globalFrame = windowStartFrame + localFrame,
-            )
+            sequenceDecoder.add(heads, localFrame, windowStartFrame + localFrame)
         }
     }
 
@@ -133,22 +118,32 @@ class CremaSongAnalyzer internal constructor(
         while (segmentStart < ordered.size) {
             val label = ordered[segmentStart].label
             var segmentEnd = segmentStart + 1
-            while (segmentEnd < ordered.size && ordered[segmentEnd].label == label) {
-                segmentEnd++
-            }
+            while (segmentEnd < ordered.size && ordered[segmentEnd].label == label) segmentEnd++
 
             if (label != null) {
-                val startMs = frameToMs(ordered[segmentStart].frame)
+                val slice = ordered.subList(segmentStart, segmentEnd)
+                val startMs = frameToMs(slice.first().frame)
                 val nextFrame = ordered.getOrNull(segmentEnd)?.frame
                 val endMs = if (nextFrame != null) frameToMs(nextFrame) else durationMs
-                val confidence = ordered.subList(segmentStart, segmentEnd)
-                    .map { it.confidence }
-                    .averageOrZero()
+                val pitchCounts = linkedMapOf<String, Int>()
+                for (prediction in slice) {
+                    for (pitch in prediction.pitchClasses) {
+                        pitchCounts[pitch] = (pitchCounts[pitch] ?: 0) + 1
+                    }
+                }
+                val minimumPresence = max(1, (slice.size * 0.35).toInt())
                 raw += SongChordSegment(
                     label = label,
                     startMs = startMs.coerceAtMost(durationMs),
                     endMs = max(startMs, endMs).coerceAtMost(durationMs),
-                    confidence = confidence,
+                    confidence = slice.map { it.confidence }.averageOrZero(),
+                    root = modeString(slice.mapNotNull { it.root }),
+                    bass = modeString(slice.mapNotNull { it.bass }),
+                    pitchClasses = pitchCounts
+                        .filterValues { it >= minimumPresence }
+                        .toList()
+                        .sortedByDescending { it.second }
+                        .map { it.first },
                 )
             }
             segmentStart = segmentEnd
@@ -166,12 +161,14 @@ class CremaSongAnalyzer internal constructor(
                 val previousDuration = max(1L, previous.endMs - previous.startMs)
                 val segmentDuration = max(1L, segment.endMs - segment.startMs)
                 val weightedConfidence = (
-                    previous.confidence * previousDuration +
-                        segment.confidence * segmentDuration
+                    previous.confidence * previousDuration + segment.confidence * segmentDuration
                 ) / (previousDuration + segmentDuration).toDouble()
                 result[result.lastIndex] = previous.copy(
                     endMs = segment.endMs,
                     confidence = weightedConfidence,
+                    root = segment.root ?: previous.root,
+                    bass = segment.bass ?: previous.bass,
+                    pitchClasses = (previous.pitchClasses + segment.pitchClasses).distinct(),
                 )
             } else {
                 result += segment
@@ -179,6 +176,12 @@ class CremaSongAnalyzer internal constructor(
         }
         return result
     }
+
+    private fun modeString(values: List<String>): String? = values
+        .groupingBy { it }
+        .eachCount()
+        .maxByOrNull { it.value }
+        ?.key
 
     private fun frameToMs(frame: Long): Long =
         frame * CremaContract.HOP_LENGTH * 1000L / CremaContract.SAMPLE_RATE
