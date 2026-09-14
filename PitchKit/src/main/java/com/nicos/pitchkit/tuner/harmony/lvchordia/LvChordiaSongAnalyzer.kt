@@ -13,7 +13,7 @@ import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
 
-/** Offline LV Song large-vocabulary analyzer with register-aware pitch refinement. */
+/** Offline LV Song large-vocabulary analyzer using the ensemble + dictionary HMM as authority. */
 class LvChordiaSongAnalyzer internal constructor(
     modelBytes: List<ByteArray>,
     dictionaryJson: String,
@@ -111,13 +111,11 @@ class LvChordiaSongAnalyzer internal constructor(
         require(modelDecoded.size == frames.size)
         logHarmonyDiagnostics(modelDecoded, frames, heads)
 
-        val decoded = rerankExtensionsWithPitchEvidence(
-            decoded = modelDecoded,
-            frames = frames,
-            harmonyChroma = features.harmonyChroma,
-            bassChroma = features.bassChroma,
-            chromaFrameCount = features.frameCount,
-        )
+        // Upstream LV-Chordia's full-song path is model ensemble -> dictionary
+        // HMM -> chord segments. Do not silently rewrite that decoded sequence
+        // from a second handcrafted chroma scorer; doing so can turn a correct,
+        // low-confidence model result into a confident but different chord.
+        val decoded = modelDecoded
 
         val chords = buildChordSegments(decoded, frames, finalDuration)
         val result = SongHarmonyAnalysis(
@@ -187,6 +185,10 @@ class LvChordiaSongAnalyzer internal constructor(
         sections = if (durationMs > 0L) listOf(SongSection("A", 0L, durationMs)) else emptyList(),
     )
 
+    /**
+     * Retained for diagnostics/experiments, but deliberately not part of the
+     * production LV Song path. The HMM/dictionary result above is authoritative.
+     */
     private fun rerankExtensionsWithPitchEvidence(
         decoded: List<LvChordiaDecodedFrame>,
         frames: LongArray,
