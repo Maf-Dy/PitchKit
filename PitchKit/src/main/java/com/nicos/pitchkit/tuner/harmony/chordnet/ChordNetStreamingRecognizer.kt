@@ -112,10 +112,26 @@ class ChordNetStreamingRecognizer(
             logMagnitude = plan.config.logMagnitude,
             tailFrames = 4,
         )
+        val bassEvidence = PitchClassChordReranker.cqtBassEvidence(
+            values = features.values,
+            frameCount = features.frameCount,
+            binCount = features.binCount,
+            fmin = plan.config.fmin,
+            binsPerOctave = plan.config.binsPerOctave,
+            logMagnitude = plan.config.logMagnitude,
+            tailFrames = 4,
+        )
         val reranked = prediction.displayLabel?.let {
             PitchClassChordReranker.rerank(it, pitchEvidence)
         }
-        val finalLabel = reranked?.label ?: prediction.displayLabel
+        val rootResolved = reranked?.let {
+            PitchClassChordReranker.resolveEquivalentRoot(
+                label = it.label,
+                pitchEvidence = pitchEvidence,
+                bassEvidence = bassEvidence,
+            )
+        }
+        val finalLabel = rootResolved?.label ?: reranked?.label ?: prediction.displayLabel
 
         val rawRecognition = finalLabel?.let {
             ChordRecognition(
@@ -129,10 +145,18 @@ class ChordNetStreamingRecognizer(
             val top = prediction.alternatives.joinToString(separator = " | ") { candidate ->
                 "${candidate.displayLabel ?: candidate.rawLabel}=${"%.3f".format(candidate.confidence)}"
             }
-            val correction = reranked
-                ?.takeIf { it.changed }
-                ?.let { " correction=${prediction.displayLabel}->${it.label} pitch=${"%.3f".format(it.score)}" }
-                .orEmpty()
+            val correctionParts = mutableListOf<String>()
+            reranked?.takeIf { it.changed }?.let {
+                correctionParts += "quality=${prediction.displayLabel}->${it.label}"
+            }
+            rootResolved?.takeIf { it.changed }?.let {
+                correctionParts += "root=${reranked?.label}->${it.label} bass=${"%.3f".format(it.score)}"
+            }
+            val correction = if (correctionParts.isEmpty()) {
+                ""
+            } else {
+                " correction=[${correctionParts.joinToString(",")}]"
+            }
             Log.d(
                 "PitchKitChord",
                 "backend=ChordNet raw=${prediction.displayLabel ?: "N"} " +
