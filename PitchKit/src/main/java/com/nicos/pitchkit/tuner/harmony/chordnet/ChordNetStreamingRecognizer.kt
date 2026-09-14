@@ -9,7 +9,7 @@ import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
 import com.nicos.pitchkit.tuner.models.AudioFrame
 import java.security.MessageDigest
 
-/** Low-latency rolling recognizer for ChordNet 2E1D. */
+/** Low-latency rolling recognizer for ChordNet 2E1D plus conservative CQT DSP rescue. */
 class ChordNetStreamingRecognizer(
     modelBytes: ByteArray,
     planBytes: ByteArray,
@@ -30,6 +30,11 @@ class ChordNetStreamingRecognizer(
         const val STARTUP_FRAMES = 10
         const val INFERENCE_STRIDE_FRAMES = 2
         const val LIVE_SMOOTHING_KERNEL = 5
+        const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.45
+
+        val JAZZ_RESCUE_SUFFIXES = listOf(
+            "6/9", "m6", "dim7", "ø7", "m9", "9",
+        )
     }
 
     private val maxSamples = LIVE_CONTEXT_FRAMES * ChordNetContract.HOP_LENGTH - 1
@@ -121,6 +126,8 @@ class ChordNetStreamingRecognizer(
             logMagnitude = plan.config.logMagnitude,
             tailFrames = 4,
         )
+
+        // First try to repair a related neural spelling.
         val reranked = prediction.displayLabel?.let {
             PitchClassChordReranker.rerank(it, pitchEvidence)
         }
@@ -131,16 +138,40 @@ class ChordNetStreamingRecognizer(
                 bassEvidence = bassEvidence,
             )
         }
-        val finalLabel = rootResolved?.label ?: reranked?.label ?: prediction.displayLabel
+        val modelLabel = rootResolved?.label ?: reranked?.label ?: prediction.displayLabel
+
+        // Then run an independent pitch-template detector. This is what rescues
+        // hdim7/m6/dim7 when ChordNet says N or chooses the wrong family/root.
+        val dsp = CqtChordTemplateDetector.detect(
+            pitchEvidence = pitchEvidence,
+            bassEvidence = bassEvidence,
+        )
+        val useDsp = when {
+            dsp == null -> false
+            modelLabel == null -> true
+            dsp.label == modelLabel -> false
+            prediction.confidence >= DSP_OVERRIDE_MODEL_CONFIDENCE -> false
+            !isJazzRescueLabel(dsp.label) -> false
+            dsp.score < 0.58 || dsp.margin < 0.022 -> false
+            else -> true
+        }
+
+        val finalLabel = if (useDsp) dsp!!.label else modelLabel
+        val finalConfidence = if (useDsp) {
+            maxOf(prediction.confidence, dsp!!.score.coerceIn(0.0, 1.0))
+        } else {
+            prediction.confidence
+        }
 
         val rawRecognition = finalLabel?.let {
             ChordRecognition(
                 label = it,
-                confidence = prediction.confidence,
-                backend = "ChordNet 2E1D",
+                confidence = finalConfidence,
+                backend = if (useDsp) "ChordNet + CQT DSP" else "ChordNet 2E1D",
             )
         }
         val emitted = stabilizer.update(rawRecognition)
+
         if (BuildConfig.DEBUG) {
             val top = prediction.alternatives.joinToString(separator = " | ") { candidate ->
                 "${candidate.displayLabel ?: candidate.rawLabel}=${"%.3f".format(candidate.confidence)}"
@@ -151,6 +182,9 @@ class ChordNetStreamingRecognizer(
             }
             rootResolved?.takeIf { it.changed }?.let {
                 correctionParts += "root=${reranked?.label}->${it.label} bass=${"%.3f".format(it.score)}"
+            }
+            if (useDsp && dsp != null) {
+                correctionParts += "dsp=${modelLabel ?: "N"}->${dsp.label} score=${"%.3f".format(dsp.score)} margin=${"%.3f".format(dsp.margin)}"
             }
             val correction = if (correctionParts.isEmpty()) {
                 ""
@@ -179,6 +213,9 @@ class ChordNetStreamingRecognizer(
         runner.close()
         reset()
     }
+
+    private fun isJazzRescueLabel(label: String): Boolean =
+        JAZZ_RESCUE_SUFFIXES.any { suffix -> label.endsWith(suffix) }
 
     private fun sha256(bytes: ByteArray): String = MessageDigest
         .getInstance("SHA-256")
