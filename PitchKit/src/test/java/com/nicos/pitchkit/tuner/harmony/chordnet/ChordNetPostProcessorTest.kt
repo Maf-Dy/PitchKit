@@ -25,6 +25,7 @@ class ChordNetPostProcessorTest {
             windowCount = 1,
             validFrameCount = 1,
             smoothingKernel = 1,
+            includeAlternatives = true,
         ).single()
 
         assertEquals("F#:hdim7", prediction.rawLabel)
