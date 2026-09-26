@@ -1,9 +1,9 @@
 package com.nicos.pitchkit.tuner.harmony.crema
 
-import android.os.SystemClock
-import android.util.Log
-import com.nicos.pitchkit.BuildConfig
+import com.nicos.pitchkit.tuner.PitchDiagnostics as Log
+import com.nicos.pitchkit.tuner.PitchDiagnostics
 import com.nicos.pitchkit.tuner.harmony.ChordRecognition
+import com.nicos.pitchkit.tuner.harmony.ChordUpdateTracker
 import com.nicos.pitchkit.tuner.harmony.ChordRecognizer
 import com.nicos.pitchkit.tuner.harmony.ChordStabilizer
 import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
@@ -22,16 +22,52 @@ class CremaStreamingRecognizer(
     referenceA4Hz: Double = 440.0,
     preferFlats: Boolean = false,
     minimumConfidence: Double = 0.08,
+    /**
+     * Whether the `CqtChordTemplateDetector` rescue lane may overrule the model.
+     *
+     * **Off by default since the rescue ablation**
+     * (`.accuracy-work/annotations/live-rescue-ablation-report.md` §2, §6).
+     * Crema is *indifferent* to this lane — only 3 of its 104 extension flicker
+     * changes and 2.5 % of its extension-bearing frames involved the rescue, and
+     * removing it moves family accuracy 80.8 % → 81.2 %, performed extension
+     * precision 69.5 % → 69.6 %, blankness not at all. It is off here for the
+     * same reason it is off on ChordNet (+3.2) and BTC (+4.8), where the lane is
+     * a large net loss: one behaviour across all three lanes rather than three
+     * flags, at a cost to Crema of nothing.
+     *
+     * `true` restores the pre-ablation behaviour. It is kept so the live replay
+     * harness can still benchmark that configuration (`crema-rescue`); nothing on
+     * a device selects it. `false` skips the detector's own work rather than
+     * computing it and throwing it away.
+     */
+    private val dspRescue: Boolean = false,
+    /**
+     * Model confidence at or above which the rescue is never taken, when
+     * [dspRescue] is on at all. Default is [DSP_OVERRIDE_MODEL_CONFIDENCE], now
+     * 0.60: the ablation found the previously shipped 0.80 dominated on every
+     * measured axis on the ChordNet lane it was swept on (report §6). Lowering it
+     * further gates the rescue harder; raising it lets it fire on more confident
+     * predictions.
+     */
+    private val rescueConfidenceThreshold: Double = DSP_OVERRIDE_MODEL_CONFIDENCE,
+    private val inferenceStrideFrames:Int = INFERENCE_STRIDE_FRAMES,
+    /** Optional numeric profiling callback. Runs on analysis/frontend workers; must be thread-safe and non-blocking. */
+    private val stageTiming: ((String, Long) -> Unit)? = null,
 ) : ChordRecognizer {
-    private companion object {
+    internal companion object {
         const val LIVE_CONTEXT_FRAMES = 24
         const val STARTUP_FRAMES = 8
         const val INFERENCE_STRIDE_FRAMES = 2
         const val EVIDENCE_SMOOTHING_FRAMES = 3
-        const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.80
+        /**
+         * Default [rescueConfidenceThreshold] for when the rescue is enabled at
+         * all. 0.60, not the historical 0.80, which the ablation report found
+         * dominated on every measured axis (§6).
+         */
+        const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.60
     }
 
-    private val frontend = CremaHcqtFrontend(harmonic1PlanBytes, harmonic2PlanBytes)
+    private val frontend = CremaHcqtFrontend(harmonic1PlanBytes, harmonic2PlanBytes, stageTiming)
     private val runner = CremaOnnxRunner(modelBytes)
     private val decoder = CremaHarmonyDecoder(
         state = CremaRuntimeState.parse(runtimeStateJson),
@@ -51,11 +87,17 @@ class CremaStreamingRecognizer(
     private var totalTargetSamples = 0L
     private var lastInferenceAt = 0L
     private var closed = false
+    private val updates = ChordUpdateTracker()
+    override val latestUpdate get() = updates.latest
     private var inferenceCount = 0
 
     init {
+        require(inferenceStrideFrames in 1..8)
         require(referenceA4Hz in 300.0..600.0) {
             "referenceA4Hz must be between 300 and 600 Hz"
+        }
+        require(rescueConfidenceThreshold in 0.0..1.0) {
+            "rescueConfidenceThreshold must be between 0 and 1"
         }
     }
 
@@ -63,7 +105,9 @@ class CremaStreamingRecognizer(
     override fun recognize(frame: AudioFrame): ChordRecognition? {
         if (closed) return null
 
+        val resampleStarted = if (stageTiming != null) System.nanoTime() else 0L
         val targetSamples = resampler.process(frame.toMono(), frame.sampleRate)
+        stageTiming?.invoke("cremaResampleMs", System.nanoTime() - resampleStarted)
         if (targetSamples.isEmpty()) return stabilizer.currentWithoutPrediction()
 
         audio.append(targetSamples)
@@ -72,22 +116,27 @@ class CremaStreamingRecognizer(
         val minimumSamples = STARTUP_FRAMES * CremaContract.HOP_LENGTH
         if (audio.size < minimumSamples) return stabilizer.currentWithoutPrediction()
 
-        val inferenceStride = INFERENCE_STRIDE_FRAMES * CremaContract.HOP_LENGTH
+        val inferenceStride = inferenceStrideFrames * CremaContract.HOP_LENGTH
         if (totalTargetSamples - lastInferenceAt < inferenceStride) {
             return stabilizer.currentWithoutPrediction()
         }
         lastInferenceAt = totalTargetSamples
 
-        val startedAt = SystemClock.elapsedRealtimeNanos()
+        val startedAt = System.nanoTime()
         val features = frontend.transform(audio.toFloatArray())
-        val hcqtDoneAt = SystemClock.elapsedRealtimeNanos()
-        if (features.frameCount <= 0 || closed) return stabilizer.update(null)
+        val hcqtDoneAt = System.nanoTime()
+        stageTiming?.invoke("cremaFrontendMs", hcqtDoneAt - startedAt)
+        if (features.frameCount <= 0 || closed) return updates.record(stabilizer.update(null))
 
         val heads = runner.infer(features.values, features.frameCount)
         if (closed) return null
-        val onnxDoneAt = SystemClock.elapsedRealtimeNanos()
+        val onnxDoneAt = System.nanoTime()
+        stageTiming?.invoke("cremaOnnxMs", onnxDoneAt - hcqtDoneAt)
+        val decodeStarted = if (stageTiming != null) System.nanoTime() else 0L
         val prediction = decoder.decode(heads)
-
+        stageTiming?.invoke("cremaDecodeMs", System.nanoTime() - decodeStarted)
+        val postStarted = if (stageTiming != null) System.nanoTime() else 0L
+        try {
         logTiming(startedAt, hcqtDoneAt, onnxDoneAt, features.frameCount)
 
         val currentPitchEvidence = averageTail(
@@ -107,7 +156,8 @@ class CremaStreamingRecognizer(
         val gesture = gestureEvidence.update(currentPitchEvidence, currentBassEvidence)
 
         if (!gesture.ready) {
-            if (BuildConfig.DEBUG) {
+            updates.record(null)
+            if (PitchDiagnostics.enabled) {
                 Log.d(
                     "PitchKitChord",
                     "backend=Crema forming updates=${gesture.updateCount} " +
@@ -129,10 +179,14 @@ class CremaStreamingRecognizer(
         }
         val modelLabel = rootResolved?.label ?: reranked?.label ?: prediction?.label
 
-        val dsp = CqtChordTemplateDetector.detect(
-            pitchEvidence = gesture.pitch,
-            bassEvidence = gesture.bass,
-        )
+        val dsp = if (dspRescue) {
+            CqtChordTemplateDetector.detect(
+                pitchEvidence = gesture.pitch,
+                bassEvidence = gesture.bass,
+            )
+        } else {
+            null
+        }
         val strongDsp = dsp != null &&
             CqtChordTemplateDetector.isRescueCandidate(dsp.label) &&
             dsp.score >= 0.58 &&
@@ -142,7 +196,7 @@ class CremaStreamingRecognizer(
             modelLabel == null -> strongDsp
             dsp.label == modelLabel -> false
             !strongDsp -> false
-            (prediction?.confidence ?: 0.0) >= DSP_OVERRIDE_MODEL_CONFIDENCE -> false
+            (prediction?.confidence ?: 0.0) >= rescueConfidenceThreshold -> false
             else -> true
         }
 
@@ -171,7 +225,11 @@ class CremaStreamingRecognizer(
             gestureStable = gesture.stableUpdates,
             emitted = emitted,
         )
+        updates.record(emitted)
         return emitted
+        } finally {
+            stageTiming?.invoke("cremaPostprocessMs", System.nanoTime() - postStarted)
+        }
     }
 
     @Synchronized
@@ -190,6 +248,7 @@ class CremaStreamingRecognizer(
     }
 
     private fun resetState() {
+        updates.reset()
         audio.clear()
         resampler.reset()
         totalTargetSamples = 0L
@@ -234,7 +293,7 @@ class CremaStreamingRecognizer(
         gestureStable: Int,
         emitted: ChordRecognition?,
     ) {
-        if (!BuildConfig.DEBUG) return
+        if (!PitchDiagnostics.enabled) return
         val top = prediction?.alternatives
             ?.joinToString(separator = " | ") { candidate ->
                 "${candidate.label}=fit:${"%.3f".format(candidate.fit)},tag:${"%.3f".format(candidate.tagConfidence)}"
@@ -263,7 +322,7 @@ class CremaStreamingRecognizer(
         onnxDoneAt: Long,
         frames: Int,
     ) {
-        if (!BuildConfig.DEBUG) return
+        if (!PitchDiagnostics.enabled) return
         inferenceCount++
         if (inferenceCount % 8 != 0) return
 

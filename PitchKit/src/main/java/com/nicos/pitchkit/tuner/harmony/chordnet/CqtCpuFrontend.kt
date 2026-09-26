@@ -9,7 +9,11 @@ import kotlin.math.sqrt
 /** CPU implementation of the plan-driven recursive librosa CQT. */
 class CqtCpuFrontend(
     private val plan: CqtPlan,
+    /** Optional aggregate timings per transform; callback can run on a frontend worker. */
+    private val stageTiming: ((String, Long) -> Unit)? = null,
 ) {
+    private val downsampler = CqtDownsampler(plan.downsample)
+    private val orderedOctaves = plan.octaves.sortedBy { it.index }
     init {
         require(plan.octaves.isNotEmpty())
         require(plan.config.sampleRate > 0.0)
@@ -32,15 +36,23 @@ class CqtCpuFrontend(
 
         var current = audio
         var downsampleCount = 0
+        var downsampleNanos = 0L
+        var projectionNanos = 0L
 
-        for (octave in plan.octaves.sortedBy { it.index }) {
+        for (octave in orderedOctaves) {
             val targetDownsampleCount = plan.earlyDownsampleCount + octave.index
             while (downsampleCount < targetDownsampleCount) {
-                current = downsampleByTwo(current)
+                val started = if (stageTiming != null) System.nanoTime() else 0L
+                current = downsampler.transform(current)
+                if (stageTiming != null) downsampleNanos += System.nanoTime() - started
                 downsampleCount++
             }
+            val started = if (stageTiming != null) System.nanoTime() else 0L
             processOctave(current, octave, frameCount, output)
+            if (stageTiming != null) projectionNanos += System.nanoTime() - started
         }
+        stageTiming?.invoke("DownsampleMs", downsampleNanos)
+        stageTiming?.invoke("ProjectionMs", projectionNanos)
 
         return Features(output, frameCount, plan.config.nBins)
     }
@@ -99,26 +111,6 @@ class CqtCpuFrontend(
                 }
             }
         }
-    }
-
-    private fun downsampleByTwo(input: FloatArray): FloatArray {
-        val outputCount = ceil(input.size / 2.0).toInt()
-        val output = FloatArray(outputCount)
-        val downsample = plan.downsample
-        val delay = downsample.delay
-
-        for (outputIndex in output.indices) {
-            val center = outputIndex * 2
-            var value = 0.0
-            for (tap in 0 until downsample.tapCount) {
-                val sourceIndex = center + tap - delay
-                if (sourceIndex !in input.indices) continue
-                val distance = kotlin.math.abs(tap - delay)
-                value += input[sourceIndex] * downsample.halfCoefficients[distance]
-            }
-            output[outputIndex] = (value * downsample.gain).toFloat()
-        }
-        return output
     }
 
     private fun getCqtFrameCount(sampleCount: Int): Int {

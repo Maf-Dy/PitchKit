@@ -22,7 +22,15 @@ internal object LvChordiaPseudoPlanDecoder {
     private const val MAGIC = 0x3150564c
     private const val HEADER_BYTES = 96
 
-    fun decodeAndVerify(artifact: ByteArray): LvChordiaPseudoPlan {
+    /**
+     * @param expectedBinCount how many pseudo-CQT bins the caller's plan keeps. LV Song
+     * crops the top 18 hybrid bins inside the plan; ChordFormer needs all 50 because its
+     * extractor takes the dB reference over the full 288-bin spectrogram first.
+     */
+    fun decodeAndVerify(
+        artifact: ByteArray,
+        expectedBinCount: Int = LvChordiaContract.PSEUDO_MODEL_BINS,
+    ): LvChordiaPseudoPlan {
         require(artifact.size >= HEADER_BYTES) { "LV-Chordia pseudo-CQT plan is truncated" }
         val data = ByteBuffer.wrap(artifact).order(ByteOrder.LITTLE_ENDIAN)
         require(data.getInt(0) == MAGIC) { "Invalid LV-Chordia pseudo-CQT magic" }
@@ -63,7 +71,9 @@ internal object LvChordiaPseudoPlanDecoder {
         require(fftSize > 0 && fftSize and (fftSize - 1) == 0) {
             "LV-Chordia pseudo-CQT FFT size must be a power of two"
         }
-        require(binCount == LvChordiaContract.PSEUDO_MODEL_BINS)
+        require(binCount == expectedBinCount) {
+            "Pseudo-CQT plan has $binCount bins, expected $expectedBinCount"
+        }
         require(coefficientCount >= 0)
 
         val rowOffsets = IntArray(binCount + 1) { index ->

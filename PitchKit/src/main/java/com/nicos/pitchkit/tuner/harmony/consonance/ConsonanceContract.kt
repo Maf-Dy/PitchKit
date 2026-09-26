@@ -15,6 +15,9 @@ object ConsonanceContract {
     const val PITCH_THRESHOLD = 0.50f
     const val MIN_SEGMENT_SECONDS = 0.50
 
+    // Declared operating point of the dictionary Viterbi decoder, fixed before scoring.
+    const val TRANSITION_PENALTY = 100.0
+
     const val INPUT_NAME = "cqt"
     const val ROOT_OUTPUT = "root"
     const val BASS_OUTPUT = "bass"
@@ -24,7 +27,11 @@ object ConsonanceContract {
     const val MODEL_FILE = "consonance-decomposed.onnx"
     const val METADATA_FILE = "consonance-meta.json"
     const val PLAN_FILE = "consonance-cqt-plan.bin"
+    const val DICTIONARY_FILE = "consonance-dictionary.json"
 
     const val SOURCE_COMMIT = "d17633aea4e68e616e735d09df97b97ae3428e71"
     const val PLAN_SHA256 = "419bf3d2aa82dc58b56670620e8351be5806db7e49730b1ef657e9e806f1bab0"
+
+    // Produced by tools/accuracy_audit/export_consonance_dictionary.py.
+    const val DICTIONARY_SHA256 = "2c0934e9a55b401154cab91b87a04f68e692807a79809c66c454669457b1582c"
 }

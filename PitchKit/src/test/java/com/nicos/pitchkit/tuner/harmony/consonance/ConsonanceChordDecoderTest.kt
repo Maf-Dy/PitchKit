@@ -29,6 +29,53 @@ class ConsonanceChordDecoderTest {
         assertEquals("F#dim7", result.label)
     }
 
+    @Test
+    fun decodesFramesIndependentlyWithoutTemporalSmoothing() {
+        val cMajor = frameLogits(root = 0, bass = 0, pitches = intArrayOf(0, 4, 7))
+        val fMajor = frameLogits(root = 5, bass = 5, pitches = intArrayOf(5, 9, 0))
+        val heads = ConsonanceHeads(
+            frames = 2,
+            root = cMajor.root + fMajor.root,
+            bass = cMajor.bass + fMajor.bass,
+            pitch = cMajor.pitch + fMajor.pitch,
+        )
+        val result = decoder.decode(heads)
+        assertEquals("C", result[0].label)
+        assertEquals("F", result[1].label)
+    }
+
+    @Test
+    fun completesMissingFifthForRootAndThird() {
+        val result = decoder.decode(heads(root = 0, bass = 0, pitches = intArrayOf(0, 4))).single()
+        assertEquals("C", result.label)
+        assertTrue(result.pitchClasses.contains("G"))
+    }
+
+    @Test
+    fun flatSixthDoesNotBlockFifthCompletion() {
+        val result = decoder.decode(heads(root = 0, bass = 0, pitches = intArrayOf(0, 4, 8))).single()
+        assertEquals("C:(1,3,5,b6)", result.label)
+    }
+
+    @Test
+    fun interposedDegreeSuppressesFifthCompletion() {
+        val result = decoder.decode(heads(root = 0, bass = 0, pitches = intArrayOf(0, 2, 4))).single()
+        assertEquals("C:(1,9,3)", result.label)
+        assertTrue(!result.pitchClasses.contains("G"))
+    }
+
+    private data class FrameLogits(
+        val root: FloatArray,
+        val bass: FloatArray,
+        val pitch: FloatArray,
+    )
+
+    private fun frameLogits(root: Int, bass: Int, pitches: IntArray): FrameLogits = FrameLogits(
+        root = FloatArray(13) { -6f }.also { it[root] = 6f },
+        bass = FloatArray(13) { -6f }.also { it[bass] = 6f },
+        pitch = FloatArray(12) { -6f }.also { for (pc in pitches) it[pc] = 6f },
+    )
+
     private fun heads(root: Int, bass: Int, pitches: IntArray): ConsonanceHeads {
         val rootLogits = FloatArray(13) { -6f }.also { it[root] = 6f }
         val bassLogits = FloatArray(13) { -6f }.also { it[bass] = 6f }

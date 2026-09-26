@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "source": "tools/accuracy_audit/export_chordformer.py --stage cqt",
+  "extractor": "extractors/cqt.py::CQTV2 (librosa.hybrid_cqt + amplitude_to_db(ref=max))",
+  "librosa": "0.9.2",
+  "numpy": "1.26.4",
+  "seed": 742,
+  "sample_rate": 22050,
+  "hop_length": 512,
+  "bins_per_octave": 36,
+  "fmin_hz": 23.12465141947715,
+  "original_bins": 288,
+  "tuning": 0.0,
+  "tuning_note": "upstream passes tuning=None (per-signal estimate); the reference and the Android plan are both pinned at tuning=0",
+  "model_crop": [
+    18,
+    270
+  ],
+  "input_bins": 252,
+  "frames": 173,
+  "sha256": {
+    "chordformer-cqt-audio.f32": "80f24cc02969684dd141134b0f5cf739d0be5d368a95ca438f7c9ba041d497fe",
+    "chordformer-cqt-expected.f32": "a4f86624d1199a2d72b3d9b683b437b70637d321526763e0169630ec95151f61"
+  }
+}

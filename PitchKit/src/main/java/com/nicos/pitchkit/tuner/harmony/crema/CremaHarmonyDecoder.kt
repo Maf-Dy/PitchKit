@@ -1,6 +1,6 @@
 package com.nicos.pitchkit.tuner.harmony.crema
 
-import com.nicos.pitchkit.BuildConfig
+import com.nicos.pitchkit.tuner.PitchDiagnostics
 import kotlin.math.max
 
 internal data class CremaCandidateDiagnostic(
@@ -61,7 +61,7 @@ internal class CremaHarmonyDecoder(
         var noChordProbability = 0.0
         var bestIndex = -1
         var bestProbability = Double.NEGATIVE_INFINITY
-        val diagnostics = if (BuildConfig.DEBUG) mutableListOf<CremaCandidateDiagnostic>() else null
+        val diagnostics = if (PitchDiagnostics.enabled) mutableListOf<CremaCandidateDiagnostic>() else null
 
         for (index in state.labels.indices) {
             val raw = state.labels[index]

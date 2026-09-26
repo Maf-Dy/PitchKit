@@ -1,0 +1,541 @@
+{
+ "schema_version": 1,
+ "song": "85dede0a8591",
+ "lane": "anime-hmm-w30-o50",
+ "frames": 3254,
+ "seconds_per_frame": 0.023219954648526078,
+ "min_duration_chord": 0.1,
+ "root_runs": [
+  [
+   10,
+   199
+  ],
+  [
+   691,
+   149
+  ],
+  [
+   260,
+   153
+  ],
+  [
+   581,
+   103
+  ],
+  [
+   251,
+   44
+  ],
+  [
+   570,
+   151
+  ],
+  [
+   147,
+   81
+  ],
+  [
+   133,
+   71
+  ],
+  [
+   456,
+   127
+  ],
+  [
+   464,
+   20
+  ],
+  [
+   408,
+   63
+  ],
+  [
+   691,
+   87
+  ],
+  [
+   283,
+   102
+  ],
+  [
+   260,
+   47
+  ],
+  [
+   384,
+   67
+  ],
+  [
+   691,
+   85
+  ],
+  [
+   260,
+   148
+  ],
+  [
+   581,
+   150
+  ],
+  [
+   570,
+   150
+  ],
+  [
+   148,
+   79
+  ],
+  [
+   147,
+   70
+  ],
+  [
+   464,
+   152
+  ],
+  [
+   408,
+   63
+  ],
+  [
+   691,
+   86
+  ],
+  [
+   283,
+   148
+  ],
+  [
+   384,
+   15
+  ],
+  [
+   387,
+   52
+  ],
+  [
+   691,
+   84
+  ],
+  [
+   260,
+   149
+  ],
+  [
+   581,
+   81
+  ],
+  [
+   603,
+   51
+  ],
+  [
+   593,
+   20
+  ],
+  [
+   387,
+   53
+  ],
+  [
+   570,
+   94
+  ],
+  [
+   133,
+   46
+  ],
+  [
+   744,
+   14
+  ]
+ ],
+ "bass_runs": [
+  [
+   1,
+   199
+  ],
+  [
+   12,
+   148
+  ],
+  [
+   5,
+   152
+  ],
+  [
+   10,
+   298
+  ],
+  [
+   3,
+   150
+  ],
+  [
+   8,
+   150
+  ],
+  [
+   7,
+   65
+  ],
+  [
+   12,
+   86
+  ],
+  [
+   5,
+   110
+  ],
+  [
+   12,
+   40
+  ],
+  [
+   7,
+   65
+  ],
+  [
+   12,
+   85
+  ],
+  [
+   5,
+   66
+  ],
+  [
+   10,
+   37
+  ],
+  [
+   3,
+   45
+  ],
+  [
+   10,
+   206
+  ],
+  [
+   3,
+   58
+  ],
+  [
+   10,
+   36
+  ],
+  [
+   3,
+   150
+  ],
+  [
+   8,
+   151
+  ],
+  [
+   7,
+   64
+  ],
+  [
+   12,
+   85
+  ],
+  [
+   5,
+   149
+  ],
+  [
+   7,
+   66
+  ],
+  [
+   12,
+   85
+  ],
+  [
+   5,
+   64
+  ],
+  [
+   10,
+   40
+  ],
+  [
+   5,
+   42
+  ],
+  [
+   10,
+   156
+  ],
+  [
+   7,
+   50
+  ],
+  [
+   3,
+   156
+  ]
+ ],
+ "expected_segments": [
+  {
+   "start": 0.0,
+   "end": 4.6208,
+   "label": "C:maj7",
+   "raw_label": "CM7"
+  },
+  {
+   "start": 4.6208,
+   "end": 8.0805,
+   "label": "B:7",
+   "raw_label": "B7"
+  },
+  {
+   "start": 8.0805,
+   "end": 11.6332,
+   "label": "E:min7",
+   "raw_label": "Em7"
+  },
+  {
+   "start": 11.6332,
+   "end": 14.0249,
+   "label": "A:9",
+   "raw_label": "A7(9)"
+  },
+  {
+   "start": 14.0249,
+   "end": 15.0465,
+   "label": "E:min/4",
+   "raw_label": "Em/A"
+  },
+  {
+   "start": 15.0465,
+   "end": 18.5527,
+   "label": "A:min7",
+   "raw_label": "Am7"
+  },
+  {
+   "start": 18.5527,
+   "end": 20.4336,
+   "label": "D:9",
+   "raw_label": "D7(9)"
+  },
+  {
+   "start": 20.4336,
+   "end": 22.0822,
+   "label": "D:7",
+   "raw_label": "D7"
+  },
+  {
+   "start": 22.0822,
+   "end": 25.0311,
+   "label": "G:maj6(9)",
+   "raw_label": "G69"
+  },
+  {
+   "start": 25.0311,
+   "end": 25.4955,
+   "label": "G:maj9",
+   "raw_label": "GM7(9)"
+  },
+  {
+   "start": 25.4955,
+   "end": 26.9816,
+   "label": "Gb:min7(11)",
+   "raw_label": "Gbm7(11)"
+  },
+  {
+   "start": 26.9816,
+   "end": 28.9785,
+   "label": "B:7",
+   "raw_label": "B7"
+  },
+  {
+   "start": 28.9785,
+   "end": 31.3469,
+   "label": "E:min9",
+   "raw_label": "Em7(9)"
+  },
+  {
+   "start": 31.3469,
+   "end": 31.5327,
+   "label": "E:min7",
+   "raw_label": "Em7"
+  },
+  {
+   "start": 31.5327,
+   "end": 32.4615,
+   "label": "E:min7/5",
+   "raw_label": "Em7/B"
+  },
+  {
+   "start": 32.4615,
+   "end": 33.994,
+   "label": "Gb:min7",
+   "raw_label": "Gbm7"
+  },
+  {
+   "start": 33.994,
+   "end": 35.9677,
+   "label": "B:7",
+   "raw_label": "B7"
+  },
+  {
+   "start": 35.9677,
+   "end": 37.477,
+   "label": "E:min7",
+   "raw_label": "Em7"
+  },
+  {
+   "start": 37.477,
+   "end": 38.3361,
+   "label": "E:min7/4",
+   "raw_label": "Em7/A"
+  },
+  {
+   "start": 38.3361,
+   "end": 39.4043,
+   "label": "E:min7/b7",
+   "raw_label": "Em7/D"
+  },
+  {
+   "start": 39.4043,
+   "end": 42.8873,
+   "label": "A:9",
+   "raw_label": "A7(9)"
+  },
+  {
+   "start": 42.8873,
+   "end": 44.1644,
+   "label": "A:min7",
+   "raw_label": "Am7"
+  },
+  {
+   "start": 44.1644,
+   "end": 45.5111,
+   "label": "A:min7/4",
+   "raw_label": "Am7/D"
+  },
+  {
+   "start": 45.5111,
+   "end": 46.3702,
+   "label": "A:min7",
+   "raw_label": "Am7"
+  },
+  {
+   "start": 46.3702,
+   "end": 48.2046,
+   "label": "D:7(13)",
+   "raw_label": "D7(13)"
+  },
+  {
+   "start": 48.2046,
+   "end": 49.83,
+   "label": "D:9",
+   "raw_label": "D7(9)"
+  },
+  {
+   "start": 49.83,
+   "end": 53.3595,
+   "label": "G:maj9",
+   "raw_label": "GM7(9)"
+  },
+  {
+   "start": 53.3595,
+   "end": 54.8223,
+   "label": "Gb:min7(11)",
+   "raw_label": "Gbm7(11)"
+  },
+  {
+   "start": 54.8223,
+   "end": 56.8192,
+   "label": "B:7",
+   "raw_label": "B7"
+  },
+  {
+   "start": 56.8192,
+   "end": 60.2558,
+   "label": "E:min9",
+   "raw_label": "Em7(9)"
+  },
+  {
+   "start": 60.2558,
+   "end": 60.6041,
+   "label": "Gb:min7",
+   "raw_label": "Gbm7"
+  },
+  {
+   "start": 60.6041,
+   "end": 61.8115,
+   "label": "Gb:hdim7",
+   "raw_label": "Gbm7-5"
+  },
+  {
+   "start": 61.8115,
+   "end": 63.762,
+   "label": "B:7",
+   "raw_label": "B7"
+  },
+  {
+   "start": 63.762,
+   "end": 65.2481,
+   "label": "E:min7",
+   "raw_label": "Em7"
+  },
+  {
+   "start": 65.2481,
+   "end": 66.1769,
+   "label": "E:min7/4",
+   "raw_label": "Em7/A"
+  },
+  {
+   "start": 66.1769,
+   "end": 67.2218,
+   "label": "E:min7",
+   "raw_label": "Em7"
+  },
+  {
+   "start": 67.2218,
+   "end": 69.1026,
+   "label": "A:9",
+   "raw_label": "A7(9)"
+  },
+  {
+   "start": 69.1026,
+   "end": 70.2868,
+   "label": "A:13",
+   "raw_label": "A7(9,13)"
+  },
+  {
+   "start": 70.2868,
+   "end": 70.7744,
+   "label": "A:min9",
+   "raw_label": "Am7(9)"
+  },
+  {
+   "start": 70.7744,
+   "end": 71.9819,
+   "label": "Gb:hdim7",
+   "raw_label": "Gbm7-5"
+  },
+  {
+   "start": 71.9819,
+   "end": 74.1645,
+   "label": "A:min7/4",
+   "raw_label": "Am7/D"
+  },
+  {
+   "start": 74.1645,
+   "end": 75.2327,
+   "label": "D:7",
+   "raw_label": "D7"
+  },
+  {
+   "start": 75.2327,
+   "end": 75.5577,
+   "label": "N",
+   "raw_label": "N"
+  }
+ ],
+ "note": "Per-frame decoded indices for a whole song, run-length encoded, plus the segments `.accuracy-work/anime-windowed-01/<song>/anime-hmm-w30-o50/result.json` published for it, canonicalised the way the review server canonicalises every anime lane."
+}

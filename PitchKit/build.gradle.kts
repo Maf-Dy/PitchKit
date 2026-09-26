@@ -27,6 +27,15 @@ android {
             withSourcesJar()
         }
     }
+
+    // The live replay harness (src/test/.../tuner/live) constructs the real
+    // streaming recognizers on the JVM. They log through android.util.Log under
+    // BuildConfig.DEBUG, which testDebugUnitTest sets true.
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -41,6 +50,11 @@ dependencies {
     implementation(libs.onnxruntime.android)
 
     testImplementation(libs.junit)
+    // Real org.json for JVM unit tests; the Android stub throws on every call.
+    testImplementation(libs.json)
+    // Desktop ONNX Runtime so the live replay harness can run the shipped models
+    // on the JVM. Same ai.onnxruntime API as the Android artifact.
+    testImplementation(libs.onnxruntime.jvm)
 }
 
 publishing {

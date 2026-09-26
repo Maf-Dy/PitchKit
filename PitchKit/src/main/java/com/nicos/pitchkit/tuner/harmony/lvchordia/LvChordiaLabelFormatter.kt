@@ -1,6 +1,6 @@
 package com.nicos.pitchkit.tuner.harmony.lvchordia
 
-internal class LvChordiaLabelFormatter(
+class LvChordiaLabelFormatter(
     private val preferFlats: Boolean = false,
 ) {
     private val sharps = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -10,6 +10,26 @@ internal class LvChordiaLabelFormatter(
         "D#" to 3, "Eb" to 3, "E" to 4, "Fb" to 4, "E#" to 5,
         "F" to 5, "F#" to 6, "Gb" to 6, "G" to 7, "G#" to 8,
         "Ab" to 8, "A" to 9, "A#" to 10, "Bb" to 10, "B" to 11, "Cb" to 11,
+    )
+
+    private val qualityNames = mapOf(
+        "maj" to "",
+        "min" to "m",
+        "maj6" to "6",
+        "min6" to "m6",
+        "maj6(9)" to "6/9",
+        "maj(6,9)" to "6/9",
+        "min6(9)" to "m6/9",
+        "min(6,9)" to "m6/9",
+        "hdim7" to "ø7",
+        "min7" to "m7",
+        "min9" to "m9",
+        "min11" to "m11",
+        "min13" to "m13",
+        "minmaj7" to "m(maj7)",
+        "sus4(b7)" to "7sus4",
+        "sus4(b7,9)" to "9sus4",
+        "sus4(b7,9,13)" to "13sus4",
     )
 
     fun format(raw: String): String {
@@ -27,23 +47,7 @@ internal class LvChordiaLabelFormatter(
             suffix = suffix.substring(0, slashIndex)
         }
 
-        val normalized = when {
-            suffix == "maj" -> ""
-            suffix == "min" -> "m"
-            suffix == "maj6" -> "6"
-            suffix == "min6" -> "m6"
-            suffix == "maj6(9)" || suffix == "maj(6,9)" -> "6/9"
-            suffix == "min6(9)" || suffix == "min(6,9)" -> "m6/9"
-            suffix == "hdim7" -> "ø7"
-            suffix == "min7" -> "m7"
-            suffix == "min9" -> "m9"
-            suffix == "min11" -> "m11"
-            suffix == "min13" -> "m13"
-            suffix == "minmaj7" -> "m(maj7)"
-            suffix.startsWith("maj(") -> suffix.removePrefix("maj")
-            suffix.startsWith("min(") -> "m" + suffix.removePrefix("min")
-            else -> suffix
-        }
+        val normalized = normalizeQuality(suffix)
 
         return buildString {
             append(noteName(rootPc))
@@ -57,6 +61,22 @@ internal class LvChordiaLabelFormatter(
                 }
             }
         }
+    }
+
+    /**
+     * Harte quality -> display quality. Suspensions are never allowed to borrow a third:
+     * sus4(b7) is a 7sus4, not a m7. Any quality carrying an extension list that has no
+     * dedicated spelling keeps that list verbatim after the mapped base quality, so the
+     * label stays a truthful record of the dictionary entry.
+     */
+    private fun normalizeQuality(suffix: String): String {
+        qualityNames[suffix]?.let { return it }
+        val open = suffix.indexOf('(')
+        if (open >= 0 && suffix.endsWith(')')) {
+            val base = suffix.substring(0, open)
+            return (qualityNames[base] ?: base) + suffix.substring(open)
+        }
+        return suffix
     }
 
     private fun noteName(pc: Int): String = if (preferFlats) flats[pc] else sharps[pc]

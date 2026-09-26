@@ -14,12 +14,26 @@ class ConsonanceSongAnalyzer internal constructor(
     modelBytes: ByteArray,
     metadata: ConsonanceMetadata,
     cqtPlanBytes: ByteArray,
+    dictionaryBytes: ByteArray,
     referenceA4Hz: Double = 440.0,
     private val preferFlats: Boolean = false,
+    /** Null keeps the likelihood the dictionary asset declares. */
+    likelihood: ConsonanceLikelihood? = null,
+    /** Null keeps the chord-change penalty the dictionary asset declares. */
+    transitionPenalty: Double? = null,
 ) : AutoCloseable {
     private val runner = ConsonanceOnnxRunner(modelBytes, metadata.modelSha256)
     private val frontend: CqtCpuFrontend
-    private val decoder = ConsonanceChordDecoder(preferFlats = preferFlats)
+    private val dictionary: ConsonanceDictionary
+    private val decoder: ConsonanceDictionaryDecoder
+
+    /** The dictionary-decoder variant this analyzer actually runs. */
+    val likelihood: ConsonanceLikelihood
+    val transitionPenalty: Double
+
+    /** e.g. `Consonance dictionary · competitive · p100`; recorded as the analysis backend. */
+    val variantLabel: String
+        get() = "Consonance dictionary · ${likelihood.id} · p${formatPenalty(transitionPenalty)}"
     private val resampler = StreamingPcmResampler(
         targetRate = ConsonanceContract.SAMPLE_RATE,
         pitchScale = 440.0 / referenceA4Hz,
@@ -47,6 +61,25 @@ class ConsonanceSongAnalyzer internal constructor(
         require(plan.config.binsPerOctave == ConsonanceContract.BINS_PER_OCTAVE)
         require(!plan.config.logMagnitude) { "Consonance requires linear-magnitude CQT" }
         frontend = CqtCpuFrontend(plan)
+
+        val dictionarySha = sha256(dictionaryBytes)
+        require(dictionarySha == ConsonanceContract.DICTIONARY_SHA256) {
+            "Unexpected Consonance dictionary SHA-256: $dictionarySha"
+        }
+        dictionary = ConsonanceDictionaryParser.parse(
+            dictionaryBytes.toString(Charsets.UTF_8),
+            preferFlats,
+        )
+        this.likelihood = likelihood ?: dictionary.likelihood
+        this.transitionPenalty = transitionPenalty ?: dictionary.transitionPenalty
+        require(this.transitionPenalty >= 0.0) {
+            "Consonance transition penalty must not be negative: ${this.transitionPenalty}"
+        }
+        decoder = ConsonanceDictionaryDecoder(
+            dictionary = dictionary,
+            transitionPenalty = this.transitionPenalty,
+            likelihood = this.likelihood,
+        )
     }
 
     @Synchronized
@@ -73,7 +106,9 @@ class ConsonanceSongAnalyzer internal constructor(
             return emptyAnalysis(finalDuration).also { cachedResult = it }
         }
 
-        val frames = mutableListOf<TimedFrame>()
+        // Raw heads of every chunk are kept until the end: the dictionary Viterbi
+        // decodes the whole song in one pass, exactly as the Python reference does.
+        val retained = mutableListOf<RetainedChunk>()
         val chunkSamples = ConsonanceContract.SAMPLE_RATE * ConsonanceContract.CHUNK_SECONDS
         var chunkStartSample = 0
         while (chunkStartSample < audio.size) {
@@ -98,23 +133,23 @@ class ConsonanceSongAnalyzer internal constructor(
                 features.binCount,
             )
             val heads = runner.infer(featureMajor)
-            val decoded = decoder.decode(heads)
             val chunkStartMs = chunkStartSample * 1000L / ConsonanceContract.SAMPLE_RATE
             val actualEndMs = (chunkStartSample + actualSamples) * 1000L /
                 ConsonanceContract.SAMPLE_RATE
 
-            for (frameIndex in decoded.indices) {
-                val frameMs = chunkStartMs +
-                    frameIndex.toLong() * ConsonanceContract.HOP_LENGTH * 1000L /
-                    ConsonanceContract.SAMPLE_RATE
+            // Zero-padded tail frames of the last chunk are dropped before decoding.
+            var usableFrames = 0
+            while (usableFrames < heads.frames) {
+                val frameMs = frameTimeMs(chunkStartMs, usableFrames)
                 if (frameMs >= actualEndMs || frameMs >= finalDuration) break
-                frames += TimedFrame(frameMs, decoded[frameIndex])
+                usableFrames++
             }
+            if (usableFrames > 0) retained += RetainedChunk(heads, usableFrames, chunkStartMs)
             chunkStartSample += actualSamples
         }
         audio.clear()
 
-        val chords = buildSegments(frames, finalDuration)
+        val chords = buildSegments(retained, finalDuration)
         return SongHarmonyAnalysis(
             durationMs = finalDuration,
             chords = chords,
@@ -122,98 +157,85 @@ class ConsonanceSongAnalyzer internal constructor(
         ).also { cachedResult = it }
     }
 
-    private data class TimedFrame(
-        val timeMs: Long,
-        val chord: ConsonanceDecodedFrame,
+    private class RetainedChunk(
+        val heads: ConsonanceHeads,
+        val usableFrames: Int,
+        val startMs: Long,
     )
 
+    /**
+     * Frame times follow the analyzer's own convention (chunk offset plus
+     * frameIndex * HOP_LENGTH / SAMPLE_RATE in whole milliseconds) rather than the
+     * reference script's CHUNK_SECONDS / CHUNK_FRAMES seconds; both describe the
+     * same 512-sample hop grid.
+     */
+    private fun frameTimeMs(chunkStartMs: Long, frameIndex: Int): Long = chunkStartMs +
+        frameIndex.toLong() * ConsonanceContract.HOP_LENGTH * 1000L / ConsonanceContract.SAMPLE_RATE
+
     private fun buildSegments(
-        frames: List<TimedFrame>,
+        retained: List<RetainedChunk>,
         durationMs: Long,
     ): List<SongChordSegment> {
-        if (frames.isEmpty()) return emptyList()
-        val raw = mutableListOf<SongChordSegment>()
-        var start = 0
-        while (start < frames.size) {
-            val label = frames[start].chord.label
-            var end = start + 1
-            while (end < frames.size && frames[end].chord.label == label) end++
+        val totalFrames = retained.sumOf { it.usableFrames }
+        if (totalFrames <= 0) return emptyList()
 
-            if (label != null) {
-                val slice = frames.subList(start, end)
-                val startMs = slice.first().timeMs.coerceAtMost(durationMs)
-                val endMs = (frames.getOrNull(end)?.timeMs ?: durationMs).coerceAtMost(durationMs)
-                if (endMs > startMs) {
-                    raw += SongChordSegment(
-                        label = label,
-                        startMs = startMs,
-                        endMs = endMs,
-                        confidence = slice.map { it.chord.confidence }.averageOrZero(),
-                        root = modeString(slice.mapNotNull { it.chord.root }),
-                        bass = modeString(slice.mapNotNull { it.chord.bass }),
-                        pitchClasses = persistentPitchClasses(slice),
-                    )
-                }
+        val heads = ConsonanceHeads(
+            frames = totalFrames,
+            root = FloatArray(totalFrames * ConsonanceContract.ROOT_COUNT),
+            bass = FloatArray(totalFrames * ConsonanceContract.BASS_COUNT),
+            pitch = FloatArray(totalFrames * ConsonanceContract.PITCH_COUNT),
+        )
+        val frameTimes = LongArray(totalFrames)
+        var written = 0
+        for (chunk in retained) {
+            chunk.heads.root.copyInto(
+                destination = heads.root,
+                destinationOffset = written * ConsonanceContract.ROOT_COUNT,
+                startIndex = 0,
+                endIndex = chunk.usableFrames * ConsonanceContract.ROOT_COUNT,
+            )
+            chunk.heads.bass.copyInto(
+                destination = heads.bass,
+                destinationOffset = written * ConsonanceContract.BASS_COUNT,
+                startIndex = 0,
+                endIndex = chunk.usableFrames * ConsonanceContract.BASS_COUNT,
+            )
+            chunk.heads.pitch.copyInto(
+                destination = heads.pitch,
+                destinationOffset = written * ConsonanceContract.PITCH_COUNT,
+                startIndex = 0,
+                endIndex = chunk.usableFrames * ConsonanceContract.PITCH_COUNT,
+            )
+            for (frame in 0 until chunk.usableFrames) {
+                frameTimes[written + frame] = frameTimeMs(chunk.startMs, frame)
             }
-            start = end
+            written += chunk.usableFrames
         }
-        return removeShortSegments(raw)
+
+        val segments = decoder.decode(heads)
+        val chords = mutableListOf<SongChordSegment>()
+        for (segment in segments) {
+            val label = segment.candidate.displayLabel ?: continue
+            val startMs = frameTimes[segment.startFrame].coerceAtMost(durationMs)
+            val endMs = (frameTimes.getOrNull(segment.endFrame) ?: durationMs)
+                .coerceAtMost(durationMs)
+            if (endMs <= startMs) continue
+            chords += SongChordSegment(
+                label = label,
+                startMs = startMs,
+                endMs = endMs,
+                confidence = segment.confidence,
+                root = segment.candidate.root.takeIf { it in 0..11 }?.let(::noteName),
+                bass = segment.candidate.bass.takeIf { it in 0..11 }?.let(::noteName),
+                pitchClasses = pitchClasses(segment.candidate.mask),
+            )
+        }
+        return chords
     }
 
-    private fun persistentPitchClasses(frames: List<TimedFrame>): List<String> {
-        if (frames.isEmpty()) return emptyList()
-        val average = DoubleArray(12)
-        for (frame in frames) {
-            for (pc in 0 until 12) average[pc] += frame.chord.pitchProbabilities[pc]
-        }
-        for (pc in 0 until 12) average[pc] /= frames.size.toDouble()
-        return average.indices
-            .filter { average[it] >= 0.45 }
-            .sortedByDescending { average[it] }
-            .map(::noteName)
-    }
-
-    private fun removeShortSegments(input: List<SongChordSegment>): List<SongChordSegment> {
-        if (input.isEmpty()) return input
-        val minimumMs = (ConsonanceContract.MIN_SEGMENT_SECONDS * 1000.0).toLong()
-        val output = mutableListOf<SongChordSegment>()
-        var index = 0
-        while (index < input.size) {
-            val segment = input[index]
-            val duration = segment.endMs - segment.startMs
-            if (duration < minimumMs) {
-                if (output.isNotEmpty()) {
-                    val previous = output.removeAt(output.lastIndex)
-                    output += previous.copy(endMs = segment.endMs)
-                } else if (index + 1 < input.size) {
-                    val next = input[index + 1]
-                    output += next.copy(startMs = segment.startMs)
-                    index++
-                }
-            } else {
-                val previous = output.lastOrNull()
-                if (previous != null && previous.label == segment.label) {
-                    output[output.lastIndex] = previous.copy(
-                        endMs = segment.endMs,
-                        confidence = weightedConfidence(previous, segment),
-                        root = segment.root ?: previous.root,
-                        bass = segment.bass ?: previous.bass,
-                        pitchClasses = (previous.pitchClasses + segment.pitchClasses).distinct(),
-                    )
-                } else {
-                    output += segment
-                }
-            }
-            index++
-        }
-        return output.filter { it.endMs > it.startMs }
-    }
-
-    private fun weightedConfidence(a: SongChordSegment, b: SongChordSegment): Double {
-        val ad = max(1L, a.endMs - a.startMs)
-        val bd = max(1L, b.endMs - b.startMs)
-        return (a.confidence * ad + b.confidence * bd) / (ad + bd).toDouble()
-    }
+    private fun pitchClasses(mask: Int): List<String> = (0 until 12)
+        .filter { mask and (1 shl it) != 0 }
+        .map(::noteName)
 
     private fun transposeFrameMajorToFeatureMajor(
         values: FloatArray,
@@ -240,15 +262,13 @@ class ConsonanceSongAnalyzer internal constructor(
         for (index in 0 until actualSamples.coerceAtMost(values.size)) values[index] /= peak
     }
 
-    private fun modeString(values: List<String>): String? = values
-        .groupingBy { it }
-        .eachCount()
-        .maxByOrNull { it.value }
-        ?.key
-
     private val sharpNames = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
     private val flatNames = arrayOf("C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B")
     private fun noteName(pc: Int): String = if (preferFlats) flatNames[pc] else sharpNames[pc]
+
+    /** Whole penalties read as `p100`; anything else keeps its decimals. */
+    private fun formatPenalty(value: Double): String =
+        if (value == value.toLong().toDouble()) value.toLong().toString() else value.toString()
 
     private fun emptyAnalysis(durationMs: Long): SongHarmonyAnalysis = SongHarmonyAnalysis(
         durationMs = durationMs,
@@ -306,5 +326,3 @@ class ConsonanceSongAnalyzer internal constructor(
         }
     }
 }
-
-private fun List<Double>.averageOrZero(): Double = if (isEmpty()) 0.0 else average()

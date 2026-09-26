@@ -1,8 +1,9 @@
 package com.nicos.pitchkit.tuner.harmony.btc
 
-import android.util.Log
-import com.nicos.pitchkit.BuildConfig
+import com.nicos.pitchkit.tuner.PitchDiagnostics as Log
+import com.nicos.pitchkit.tuner.PitchDiagnostics
 import com.nicos.pitchkit.tuner.harmony.ChordRecognition
+import com.nicos.pitchkit.tuner.harmony.ChordUpdateTracker
 import com.nicos.pitchkit.tuner.harmony.ChordRecognizer
 import com.nicos.pitchkit.tuner.harmony.ChordStabilizer
 import com.nicos.pitchkit.tuner.harmony.PitchClassChordReranker
@@ -29,13 +30,47 @@ class BtcStreamingRecognizer(
     cqtPlanBytes: ByteArray,
     referenceA4Hz: Double = 440.0,
     minimumConfidence: Double = 0.08,
+    /**
+     * Whether the `CqtChordTemplateDetector` rescue lane may overrule the model.
+     *
+     * **Off by default since the rescue ablation**
+     * (`.accuracy-work/annotations/live-rescue-ablation-report.md` §2, §6). BTC
+     * is the lane the rescue hurts most on real guitar: removing it gains
+     * **+4.8** points of family accuracy (67.4 % → 72.2 %), drops the wrong-chord
+     * rate 12.7 points (31.7 % → 19.0 %), halves extension flicker (109 → 51),
+     * raises performed-layer extension precision from **21.0 % to 67.4 %** and
+     * lifts tension-*exact* 6.4 % → 9.3 %. The `A7♭9`-over-a-plain-A-major flood
+     * — 2 026 frames — disappears entirely, and all 5 styles win. The one cost is
+     * blankness: 0.9 % → 8.8 % of frames.
+     *
+     * `true` restores the pre-ablation behaviour. It is kept so the live replay
+     * harness can still benchmark that configuration (`btc-rescue`); nothing on a
+     * device selects it. `false` skips the detector's own work rather than
+     * computing it and throwing it away.
+     */
+    private val dspRescue: Boolean = false,
+    /**
+     * Model confidence at or above which the rescue is never taken, when
+     * [dspRescue] is on at all. Default is [DSP_OVERRIDE_MODEL_CONFIDENCE], now
+     * 0.60: the ablation found the previously shipped 0.80 dominated on every
+     * measured axis on the ChordNet lane it was swept on (report §6). Lowering it
+     * further gates the rescue harder; raising it lets it fire on more confident
+     * predictions.
+     */
+    private val rescueConfidenceThreshold: Double = DSP_OVERRIDE_MODEL_CONFIDENCE,
+    private val stageTiming: ((String, Long) -> Unit)? = null,
 ) : ChordRecognizer {
-    private companion object {
+    internal companion object {
         const val LIVE_CONTEXT_FRAMES = 40
         const val STARTUP_FRAMES = 10
         const val INFERENCE_STRIDE_FRAMES = 2
         const val LIVE_SMOOTHING_KERNEL = 5
-        const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.80
+        /**
+         * Default [rescueConfidenceThreshold] for when the rescue is enabled at
+         * all. 0.60, not the historical 0.80, which the ablation report found
+         * dominated on every measured axis (§6).
+         */
+        const val DSP_OVERRIDE_MODEL_CONFIDENCE = 0.60
     }
 
     private val runner = BtcOnnxRunner(modelBytes, metadata.modelSha256)
@@ -56,9 +91,14 @@ class BtcStreamingRecognizer(
     private var totalTargetSamples = 0L
     private var lastInferenceAt = 0L
     private var closed = false
+    private val updates = ChordUpdateTracker()
+    override val latestUpdate get() = updates.latest
 
     init {
         require(referenceA4Hz in 300.0..600.0)
+        require(rescueConfidenceThreshold in 0.0..1.0) {
+            "rescueConfidenceThreshold must be between 0 and 1"
+        }
         require(sha256(cqtPlanBytes) == BtcContract.PLAN_SHA256) {
             "Unexpected BTC CQT plan SHA-256"
         }
@@ -72,7 +112,7 @@ class BtcStreamingRecognizer(
     @Synchronized
     override fun recognize(frame: AudioFrame): ChordRecognition? {
         if (closed) return null
-        val target = resampler.process(frame.toMono(), frame.sampleRate)
+        val target = timed("btcResampleMs") { resampler.process(frame.toMono(), frame.sampleRate) }
         if (target.isEmpty()) return stabilizer.currentWithoutPrediction()
         audio.append(target)
         totalTargetSamples += target.size
@@ -85,8 +125,8 @@ class BtcStreamingRecognizer(
         }
         lastInferenceAt = totalTargetSamples
 
-        val features = frontend.transform(audio.toFloatArray())
-        if (features.frameCount <= 0 || closed) return stabilizer.update(null)
+        val features = timed("btcFrontendMs") { frontend.transform(audio.toFloatArray()) }
+        if (features.frameCount <= 0 || closed) return updates.record(stabilizer.update(null))
         val validFrames = features.frameCount.coerceAtMost(BtcContract.SEQUENCE_LENGTH)
         val modelInput = FloatArray(BtcContract.SEQUENCE_LENGTH * BtcContract.INPUT_BINS)
         val denominator = metadata.std.coerceAtLeast(1e-8f)
@@ -101,14 +141,14 @@ class BtcStreamingRecognizer(
             }
         }
 
-        val logits = runner.infer(modelInput, windowCount = 1)
+        val logits = timed("btcOnnxMs") { runner.infer(modelInput, windowCount = 1) }
         if (closed) return null
         val predictions = ChordNetPostProcessor.decode(
             logits = logits,
             windowCount = 1,
             validFrameCount = validFrames,
             smoothingKernel = LIVE_SMOOTHING_KERNEL,
-            includeAlternatives = BuildConfig.DEBUG,
+            includeAlternatives = PitchDiagnostics.enabled,
         )
         val prediction = predictions[validFrames - 1]
 
@@ -132,7 +172,8 @@ class BtcStreamingRecognizer(
         )
         val gesture = gestureEvidence.update(currentPitch, currentBass)
         if (!gesture.ready) {
-            if (BuildConfig.DEBUG) {
+            updates.record(null)
+            if (PitchDiagnostics.enabled) {
                 Log.d(
                     "PitchKitChord",
                     "backend=BTC-Live forming updates=${gesture.updateCount} " +
@@ -154,7 +195,7 @@ class BtcStreamingRecognizer(
         }
         val modelLabel = rootResolved?.label ?: reranked?.label ?: prediction.displayLabel
 
-        val dsp = CqtChordTemplateDetector.detect(gesture.pitch, gesture.bass)
+        val dsp = if (dspRescue) CqtChordTemplateDetector.detect(gesture.pitch, gesture.bass) else null
         val strongDsp = dsp != null &&
             CqtChordTemplateDetector.isRescueCandidate(dsp.label) &&
             dsp.score >= 0.58 && dsp.margin >= 0.022
@@ -163,7 +204,7 @@ class BtcStreamingRecognizer(
             modelLabel == null -> strongDsp
             dsp.label == modelLabel -> false
             !strongDsp -> false
-            prediction.confidence >= DSP_OVERRIDE_MODEL_CONFIDENCE -> false
+            prediction.confidence >= rescueConfidenceThreshold -> false
             else -> true
         }
 
@@ -186,7 +227,7 @@ class BtcStreamingRecognizer(
         }
         val emitted = stabilizer.update(raw)
 
-        if (BuildConfig.DEBUG) {
+        if (PitchDiagnostics.enabled) {
             val top = prediction.alternatives.joinToString(" | ") { candidate ->
                 "${candidate.displayLabel ?: candidate.rawLabel}=${"%.3f".format(candidate.confidence)}"
             }
@@ -205,6 +246,7 @@ class BtcStreamingRecognizer(
                     "top3=[$top]$correction emitted=${emitted?.label ?: "-"}",
             )
         }
+        updates.record(emitted)
         return emitted
     }
 
@@ -212,6 +254,12 @@ class BtcStreamingRecognizer(
     override fun reset() {
         if (closed) return
         resetState()
+    }
+
+    private inline fun <T> timed(name: String, action: () -> T): T {
+        val timing=stageTiming ?: return action()
+        val started=System.nanoTime()
+        return try {action()} finally {timing(name,System.nanoTime()-started)}
     }
 
     @Synchronized
@@ -223,6 +271,7 @@ class BtcStreamingRecognizer(
     }
 
     private fun resetState() {
+        updates.reset()
         audio.clear()
         resampler.reset()
         totalTargetSamples = 0L

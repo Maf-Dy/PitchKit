@@ -39,6 +39,9 @@ import com.nicos.pitchkit.tuner.harmony.chordnet.ChordNetStreamingRecognizer
 import com.nicos.pitchkit.tuner.harmony.crema.CremaAndroidFactory
 import com.nicos.pitchkit.tuner.harmony.crema.CremaContract
 import com.nicos.pitchkit.tuner.harmony.crema.CremaStreamingRecognizer
+import com.nicos.pitchkit.tuner.harmony.solitito.SolititoAndroidFactory
+import com.nicos.pitchkit.tuner.harmony.solitito.SolititoContract
+import com.nicos.pitchkit.tuner.harmony.solitito.SolititoStreamingRecognizer
 import com.nicos.pitchkit.tuner.models.InstrumentProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -84,10 +87,14 @@ fun GuitarTunerListener(
     val btcAssetsInstalled = remember(applicationContext) {
         BtcAndroidFactory.liveAssetsInstalled(applicationContext)
     }
+    val solititoAssetsInstalled = remember(applicationContext) {
+        SolititoAndroidFactory.assetsInstalled(applicationContext)
+    }
     val selectedNeuralAssetsInstalled = when (chordEngine) {
         ChordEngine.AUTO -> cremaAssetsInstalled || chordNetAssetsInstalled
         ChordEngine.CREMA -> cremaAssetsInstalled
         ChordEngine.CHORD_NET -> chordNetAssetsInstalled
+        ChordEngine.SOLITITO -> solititoAssetsInstalled
         ChordEngine.BTC_EXPERIMENTAL -> btcAssetsInstalled
         ChordEngine.CLASSIC -> false
     }
@@ -102,6 +109,7 @@ fun GuitarTunerListener(
         cremaAssetsInstalled,
         chordNetAssetsInstalled,
         btcAssetsInstalled,
+        solititoAssetsInstalled,
         referenceA4Hz,
         preferFlats,
     ) {
@@ -155,6 +163,23 @@ fun GuitarTunerListener(
                 }
             }
 
+            fun trySolitito(): ChordRecognizer? {
+                if (!solititoAssetsInstalled) {
+                    if (BuildConfig.DEBUG) Log.d("PitchKit", "solitito assets are not installed")
+                    return null
+                }
+                return try {
+                    // No referenceA4Hz: solitito's kernel and root head are fixed at the
+                    // shipped 440 Hz grid; see SolititoAndroidFactory.
+                    SolititoAndroidFactory.create(context = applicationContext).also {
+                        if (BuildConfig.DEBUG) Log.d("PitchKit", "solitito-ai recognizer loaded")
+                    }
+                } catch (error: Throwable) {
+                    Log.e("PitchKit", "solitito-ai failed to load", error)
+                    null
+                }
+            }
+
             fun tryBtc(): ChordRecognizer? {
                 if (!btcAssetsInstalled) {
                     if (BuildConfig.DEBUG) Log.d("PitchKit", "BTC live assets are not installed")
@@ -173,10 +198,20 @@ fun GuitarTunerListener(
                 }
             }
 
-            when (requestedSelection) {
-                ChordEngine.AUTO -> tryChordNet() ?: tryCrema()
+            fun tryNeural(candidate: ChordEngine): ChordRecognizer? = when (candidate) {
                 ChordEngine.CREMA -> tryCrema()
                 ChordEngine.CHORD_NET -> tryChordNet()
+                ChordEngine.SOLITITO -> trySolitito()
+                ChordEngine.BTC_EXPERIMENTAL -> tryBtc()
+                ChordEngine.AUTO, ChordEngine.CLASSIC -> null
+            }
+
+            when (requestedSelection) {
+                // Crema first, ChordNet as the fallback: see ChordEngine.AUTO_PREFERENCE.
+                ChordEngine.AUTO -> ChordEngine.AUTO_PREFERENCE.firstNotNullOfOrNull(::tryNeural)
+                ChordEngine.CREMA -> tryCrema()
+                ChordEngine.CHORD_NET -> tryChordNet()
+                ChordEngine.SOLITITO -> trySolitito()
                 ChordEngine.BTC_EXPERIMENTAL -> tryBtc()
                 ChordEngine.CLASSIC -> null
             }
@@ -252,12 +287,28 @@ fun GuitarTunerListener(
                 is CremaStreamingRecognizer -> CremaContract.SAMPLE_RATE
                 is ChordNetStreamingRecognizer -> ChordNetContract.SAMPLE_RATE
                 is BtcStreamingRecognizer -> BtcContract.SAMPLE_RATE
+                is SolititoStreamingRecognizer -> SolititoContract.SAMPLE_RATE
                 else -> 44100
             }
             val engineBufferSize = when (neural) {
                 is CremaStreamingRecognizer -> CremaContract.HOP_LENGTH
                 is ChordNetStreamingRecognizer -> ChordNetContract.HOP_LENGTH
                 is BtcStreamingRecognizer -> BtcContract.HOP_LENGTH
+                // 256 samples at 16 kHz is exactly one analysis hop and a 16 ms frame
+                // period - the smallest input-latency term of any lane in the APK
+                // (2 x 256 / 16000 = 32 ms).
+                //
+                // This is the *read* size AudioCapture delivers, not AudioRecord's own
+                // ring: `AudioCapture` opens the recorder with
+                // `maxOf(AudioRecord.getMinBufferSize(...), bufferSize * 2)` and still
+                // hands the engine exactly `bufferSize` samples a time, so a device with
+                // a large minimum costs latency inside the driver but does not coarsen
+                // this cadence. If the 16 kHz negotiation fails and AudioCapture settles
+                // on 44.1 or 48 kHz, the buffer stays 256 source samples (a *shorter*
+                // 5.8 ms) and SolititoStreamingRecognizer's own resampler accumulates
+                // them, so analysis frames still emerge every 256 samples at 16 kHz and
+                // the 40 ms inference cadence is unchanged either way.
+                is SolititoStreamingRecognizer -> SolititoContract.LIVE_BUFFER_SAMPLES
                 else -> if (mode == DetectionMode.NOTE) 4096 else 8192
             }
 
@@ -271,8 +322,11 @@ fun GuitarTunerListener(
                 chordRecognizer = neural,
                 preferredSampleRate = neuralSampleRate,
                 bufferSize = engineBufferSize,
+                // The neural lanes ask for UNPROCESSED first where the device
+                // advertises it and fall back to VOICE_RECOGNITION, then MIC,
+                // inside AudioCapture's own negotiation. Classic DSP is unchanged.
                 preferredAudioSource = if (neural != null) {
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION
+                    preferredNeuralAudioSource(applicationContext)
                 } else {
                     MediaRecorder.AudioSource.MIC
                 },

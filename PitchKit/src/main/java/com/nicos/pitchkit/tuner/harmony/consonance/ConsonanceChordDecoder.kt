@@ -61,12 +61,10 @@ internal class ConsonanceChordDecoder(
         require(heads.bass.size == heads.frames * ConsonanceContract.BASS_COUNT)
         require(heads.pitch.size == heads.frames * ConsonanceContract.PITCH_COUNT)
 
-        val rootLogits = smoothCategorical(heads.root, heads.frames, ConsonanceContract.ROOT_COUNT)
-        val bassLogits = smoothCategorical(heads.bass, heads.frames, ConsonanceContract.BASS_COUNT)
-        val pitchLogits = smoothContinuous(heads.pitch, heads.frames, ConsonanceContract.PITCH_COUNT)
-
+        // Reference decoding is strictly per-frame: raw argmax roots/basses and raw
+        // sigmoid pitch activations, with no temporal smoothing of any head.
         return List(heads.frames) { frame ->
-            decodeFrame(rootLogits, bassLogits, pitchLogits, frame)
+            decodeFrame(heads.root, heads.bass, heads.pitch, frame)
         }
     }
 
@@ -98,14 +96,16 @@ internal class ConsonanceChordDecoder(
         }
 
         val activeAbsolute = probabilities.indices
-            .filter { probabilities[it] >= pitchThreshold }
+            .filter { probabilities[it] > pitchThreshold }
             .toMutableSet()
-        // Match the reference decoder's pragmatic completion: when root+third
-        // are present but no fifth of any kind is active, add a perfect fifth.
         val rootRelative = activeAbsolute.map { floorMod12(it - rootIndex) }.toMutableSet()
-        val hasThird = 4 in rootRelative || 3 in rootRelative
-        val hasAnyFifth = 6 in rootRelative || 7 in rootRelative || 8 in rootRelative
-        if (0 in rootRelative && hasThird && !hasAnyFifth) {
+        // Reference fifth completion operates on the joined degree text: a fifth is
+        // added only when "1,3"/"1,b3" appear adjacent and no degree containing "5"
+        // (b5 or 5) is active. b6 does not block, and interposed degrees suppress it.
+        val preCompletionDegrees = rootRelative.sorted().joinToString(",") { intervalName(it) }
+        val needsFifth = ("1,3" in preCompletionDegrees || "1,b3" in preCompletionDegrees) &&
+            "5" !in preCompletionDegrees
+        if (needsFifth) {
             activeAbsolute += floorMod12(rootIndex + 7)
             rootRelative += 7
         }
@@ -146,32 +146,6 @@ internal class ConsonanceChordDecoder(
         )
     }
 
-    private fun smoothCategorical(values: FloatArray, frames: Int, width: Int): FloatArray =
-        smoothContinuous(values, frames, width, window = 5)
-
-    private fun smoothContinuous(
-        values: FloatArray,
-        frames: Int,
-        width: Int,
-        window: Int = 5,
-    ): FloatArray {
-        val output = FloatArray(values.size)
-        val radius = window / 2
-        for (frame in 0 until frames) {
-            val first = (frame - radius).coerceAtLeast(0)
-            val last = (frame + radius).coerceAtMost(frames - 1)
-            val count = (last - first + 1).toFloat()
-            val outOffset = frame * width
-            for (sourceFrame in first..last) {
-                val sourceOffset = sourceFrame * width
-                for (index in 0 until width) {
-                    output[outOffset + index] += values[sourceOffset + index] / count
-                }
-            }
-        }
-        return output
-    }
-
     private fun argmax(values: FloatArray, offset: Int, width: Int): Int {
         var best = 0
         for (index in 1 until width) {
@@ -201,17 +175,18 @@ internal class ConsonanceChordDecoder(
     private fun noteName(pc: Int): String =
         if (preferFlats) flatNames[floorMod12(pc)] else sharpNames[floorMod12(pc)]
 
+    // Mirrors the reference decoder's INTERVAL_MAP exactly.
     private fun intervalName(interval: Int): String = when (floorMod12(interval)) {
         0 -> "1"
         1 -> "b9"
         2 -> "9"
         3 -> "b3"
         4 -> "3"
-        5 -> "11"
-        6 -> "b5/#11"
+        5 -> "4"
+        6 -> "b5"
         7 -> "5"
-        8 -> "b13"
-        9 -> "6/13"
+        8 -> "b6"
+        9 -> "6"
         10 -> "b7"
         11 -> "7"
         else -> "?"

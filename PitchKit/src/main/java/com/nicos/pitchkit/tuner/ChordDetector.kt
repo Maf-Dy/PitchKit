@@ -52,8 +52,10 @@ internal class ChordDetector(
     private val topPitchClassScore = DoubleArray(12)
     private val secondPitchClassScore = DoubleArray(12)
     private val chromaScratch = DoubleArray(12)
+    private val templateScoreScratch = DoubleArray(templates.size)
     private val noteMidiScratch = IntArray((maxMidi - minMidi + 1).coerceAtLeast(1))
     private val noteScoreScratch = DoubleArray(noteMidiScratch.size)
+    private val salienceByMidi = DoubleArray(noteMidiScratch.size)
 
     private var currentChord: String? = null
     private var pendingChord: String? = null
@@ -74,20 +76,32 @@ internal class ChordDetector(
 
         var bestTemplate: Template? = null
         var bestScore = Double.NEGATIVE_INFINITY
-        var secondScore = Double.NEGATIVE_INFINITY
 
-        for (template in templates) {
-            val score = scoreTemplate(template, chroma, bass)
+        for (index in templates.indices) {
+            val score = scoreTemplate(templates[index], chroma, bass)
+            templateScoreScratch[index] = score
             if (score > bestScore) {
-                secondScore = bestScore
                 bestScore = score
-                bestTemplate = template
-            } else if (score > secondScore) {
-                secondScore = score
+                bestTemplate = templates[index]
             }
         }
 
-        val candidate = bestTemplate?.name ?: return null
+        val best = bestTemplate ?: return null
+        val candidate = best.name
+
+        // Margin measures confusion against genuinely different chords. A template
+        // whose pitch set contains or is contained by the winner (Em vs Em7/G6) is
+        // the same sonority with more or fewer extensions, not a rival name, and
+        // must not be able to veto the detection.
+        var secondScore = Double.NEGATIVE_INFINITY
+        for (index in templates.indices) {
+            val template = templates[index]
+            if (template === best) continue
+            val intersection = template.pitchMask and best.pitchMask
+            if (intersection == template.pitchMask || intersection == best.pitchMask) continue
+            val score = templateScoreScratch[index]
+            if (score > secondScore) secondScore = score
+        }
         val margin = if (secondScore.isFinite()) bestScore - secondScore else bestScore
 
         if (bestScore < minScore || margin < minMargin) {
@@ -129,6 +143,7 @@ internal class ChordDetector(
         java.util.Arrays.fill(topPitchClassScore, 0.0)
         java.util.Arrays.fill(secondPitchClassScore, 0.0)
         java.util.Arrays.fill(chromaScratch, 0.0)
+        java.util.Arrays.fill(salienceByMidi, 0.0)
 
         var noteCount = 0
         var strongestNote = 0.0
@@ -157,6 +172,7 @@ internal class ChordDetector(
                 noteScoreScratch[noteCount] = salience
                 noteCount++
             }
+            salienceByMidi[midi - minMidi] = salience
             if (salience > strongestNote) strongestNote = salience
         }
 
@@ -174,9 +190,20 @@ internal class ChordDetector(
         if (strongestNote > 0.0) {
             val threshold = strongestNote * 0.30
             for (index in 0 until noteCount) {
-                if (noteScoreScratch[index] >= threshold && noteMidiScratch[index] < bassMidi) {
-                    bassMidi = noteMidiScratch[index]
-                }
+                val midi = noteMidiScratch[index]
+                val salience = noteScoreScratch[index]
+                if (salience < threshold || midi >= bassMidi) continue
+                // A candidate weaker than a semitone neighbor is that note's
+                // spectral-leakage skirt, not a real bass fundamental.
+                val below = if (midi - 1 >= minMidi) salienceByMidi[midi - 1 - minMidi] else 0.0
+                val above = if (midi + 1 <= maxMidi) salienceByMidi[midi + 1 - minMidi] else 0.0
+                if (salience < max(below, above)) continue
+                // A candidate whose salience is nearly all harmonic support with no
+                // energy at the fundamental itself is a phantom subharmonic of the
+                // chord notes above it, not a played bass note.
+                val direct = compressedPeakNear(magnitudes, fftSize, frequencyForMidi(midi))
+                if (direct < 0.25 * salience) continue
+                bassMidi = midi
             }
         }
 

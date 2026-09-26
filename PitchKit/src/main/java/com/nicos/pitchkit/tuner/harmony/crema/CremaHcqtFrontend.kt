@@ -18,6 +18,7 @@ internal data class CremaFeatures(
 internal class CremaHcqtFrontend(
     harmonic1PlanBytes: ByteArray,
     harmonic2PlanBytes: ByteArray,
+    stageTiming: ((String, Long) -> Unit)? = null,
 ) : AutoCloseable {
     private val harmonic1: CqtCpuFrontend
     private val harmonic2: CqtCpuFrontend
@@ -37,8 +38,12 @@ internal class CremaHcqtFrontend(
         val plan2 = CqtPlanDecoder.decodeAndVerify(harmonic2PlanBytes)
         validatePlan(plan1.config.sampleRate, plan1.config.hopLength, plan1.config.nBins, plan1.config.logMagnitude)
         validatePlan(plan2.config.sampleRate, plan2.config.hopLength, plan2.config.nBins, plan2.config.logMagnitude)
-        harmonic1 = CqtCpuFrontend(plan1)
-        harmonic2 = CqtCpuFrontend(plan2)
+        harmonic1 = CqtCpuFrontend(plan1, stageTiming?.let { timing ->
+            { stage, nanos -> timing("cremaH1$stage", nanos) }
+        })
+        harmonic2 = CqtCpuFrontend(plan2, stageTiming?.let { timing ->
+            { stage, nanos -> timing("cremaH2$stage", nanos) }
+        })
     }
 
     fun transform(audio: FloatArray): CremaFeatures {

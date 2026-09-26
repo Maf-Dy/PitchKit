@@ -8,8 +8,11 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Whole-song Crema analyzer. PCM is accepted incrementally and decoded once at
- * the end with Crema's transition statistics instead of the live heuristic.
+ * Whole-song Crema analyzer. PCM is accepted incrementally, the HCQT is built in
+ * bounded windows as the audio streams in, and the accumulated feature frames are
+ * then run through the model and decoded once at the end with Crema's transition
+ * statistics instead of the live heuristic. See [CremaInferencePlanner] for why
+ * inference is a single whole-song pass.
  */
 class CremaSongAnalyzer internal constructor(
     modelBytes: ByteArray,
@@ -20,11 +23,15 @@ class CremaSongAnalyzer internal constructor(
     preferFlats: Boolean = false,
 ) : AutoCloseable {
     private companion object {
+        // HCQT windowing only: these bound how much PCM is transformed at once.
+        // The model's context is chosen by CremaInferencePlanner, not by these.
         const val WINDOW_FRAMES = 128
         const val OVERLAP_FRAMES = 16
         const val HALF_OVERLAP_FRAMES = OVERLAP_FRAMES / 2
         const val STEP_FRAMES = WINDOW_FRAMES - OVERLAP_FRAMES
         const val MIN_FINAL_FRAMES = 8
+        const val FEATURE_VALUES_PER_FRAME =
+            CremaContract.INPUT_BINS * CremaContract.HARMONIC_CHANNELS
     }
 
     private val frontend = CremaHcqtFrontend(harmonic1PlanBytes, harmonic2PlanBytes)
@@ -39,6 +46,9 @@ class CremaSongAnalyzer internal constructor(
         pitchScale = 440.0 / referenceA4Hz,
     )
     private val buffer = FloatSlidingBuffer(WINDOW_FRAMES * CremaContract.HOP_LENGTH * 2)
+
+    /** Committed HCQT frames for the whole song, fed to the model in [finish]. */
+    private val features = FloatSlidingBuffer(WINDOW_FRAMES * FEATURE_VALUES_PER_FRAME)
 
     private var windowStartFrame = 0L
     private var totalTargetSamples = 0L
@@ -66,7 +76,7 @@ class CremaSongAnalyzer internal constructor(
         val windowSamples = WINDOW_FRAMES * CremaContract.HOP_LENGTH
         val stepSamples = STEP_FRAMES * CremaContract.HOP_LENGTH
         while (buffer.size >= windowSamples) {
-            analyzeWindow(
+            extractWindowFeatures(
                 audio = buffer.copyFirst(windowSamples),
                 finalWindow = false,
             )
@@ -82,11 +92,12 @@ class CremaSongAnalyzer internal constructor(
         if (!finished) {
             val remainingFrames = buffer.size / CremaContract.HOP_LENGTH
             if (remainingFrames >= MIN_FINAL_FRAMES) {
-                analyzeWindow(
+                extractWindowFeatures(
                     audio = buffer.copyFirst(remainingFrames * CremaContract.HOP_LENGTH),
                     finalWindow = true,
                 )
             }
+            runInference()
             finished = true
         }
 
@@ -102,25 +113,67 @@ class CremaSongAnalyzer internal constructor(
         ).also { cachedResult = it }
     }
 
-    private fun analyzeWindow(audio: FloatArray, finalWindow: Boolean) {
-        val features = frontend.transform(audio)
-        if (features.frameCount <= 0) return
-        val heads = runner.infer(features.values, features.frameCount)
+    /**
+     * Streams the HCQT: only [WINDOW_FRAMES] of PCM are transformed at a time and
+     * the overlap edges are dropped, so the kept frames are contiguous. No model
+     * inference happens here - see [runInference].
+     */
+    private fun extractWindowFeatures(audio: FloatArray, finalWindow: Boolean) {
+        val window = frontend.transform(audio)
+        if (window.frameCount <= 0) return
 
         val commitStart = if (windowStartFrame == 0L) 0 else HALF_OVERLAP_FRAMES
         val commitEnd = if (finalWindow) {
-            features.frameCount
+            window.frameCount
         } else {
-            min(features.frameCount, WINDOW_FRAMES - HALF_OVERLAP_FRAMES)
+            min(window.frameCount, WINDOW_FRAMES - HALF_OVERLAP_FRAMES)
         }
         if (commitStart >= commitEnd) return
 
-        for (localFrame in commitStart until commitEnd) {
-            sequenceDecoder.add(
-                heads = heads,
-                localFrame = localFrame,
-                globalFrame = windowStartFrame + localFrame,
+        features.append(
+            window.values,
+            from = commitStart * FEATURE_VALUES_PER_FRAME,
+            to = commitEnd * FEATURE_VALUES_PER_FRAME,
+        )
+    }
+
+    private fun runInference() {
+        val frameCount = features.size / FEATURE_VALUES_PER_FRAME
+        if (frameCount <= 0) return
+
+        val plan = CremaInferencePlanner.plan(frameCount)
+        if (plan.size == 1 && frameCount > CremaInferencePlanner.FALLBACK_CHUNK_FRAMES) {
+            val failed = try {
+                inferChunks(plan)
+                false
+            } catch (_: OutOfMemoryError) {
+                true
+            } catch (_: RuntimeException) {
+                true
+            }
+            // The single pass commits nothing until it returns, so the windowed
+            // path can still run the whole song from the same features.
+            if (failed) inferChunks(CremaInferencePlanner.chunked(frameCount))
+        } else {
+            inferChunks(plan)
+        }
+        features.clear()
+    }
+
+    private fun inferChunks(chunks: List<CremaInferenceChunk>) {
+        for (chunk in chunks) {
+            val values = features.copyRange(
+                from = chunk.startFrame * FEATURE_VALUES_PER_FRAME,
+                to = chunk.endFrame * FEATURE_VALUES_PER_FRAME,
             )
+            val heads = runner.infer(values, chunk.frameCount)
+            for (frame in chunk.commitStart until chunk.commitEnd) {
+                sequenceDecoder.add(
+                    heads = heads,
+                    localFrame = frame - chunk.startFrame,
+                    globalFrame = frame.toLong(),
+                )
+            }
         }
     }
 
@@ -196,15 +249,30 @@ class CremaSongAnalyzer internal constructor(
         var size: Int = 0
             private set
 
-        fun append(input: FloatArray) {
-            ensureCapacity(size + input.size)
-            input.copyInto(values, destinationOffset = size)
-            size += input.size
+        fun append(input: FloatArray) = append(input, 0, input.size)
+
+        fun append(input: FloatArray, from: Int, to: Int) {
+            require(from in 0..to && to <= input.size)
+            val count = to - from
+            if (count == 0) return
+            ensureCapacity(size + count)
+            input.copyInto(values, destinationOffset = size, startIndex = from, endIndex = to)
+            size += count
         }
 
         fun copyFirst(count: Int): FloatArray {
             require(count in 0..size)
             return values.copyOfRange(0, count)
+        }
+
+        fun copyRange(from: Int, to: Int): FloatArray {
+            require(from in 0..to && to <= size)
+            return values.copyOfRange(from, to)
+        }
+
+        fun clear() {
+            size = 0
+            values = FloatArray(1)
         }
 
         fun dropFirst(count: Int) {

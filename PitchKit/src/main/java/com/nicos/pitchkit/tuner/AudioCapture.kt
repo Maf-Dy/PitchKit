@@ -1,7 +1,9 @@
 package com.nicos.pitchkit.tuner
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
@@ -25,6 +27,15 @@ internal class AudioCapture(
     private var activeSampleRate: Int = preferredSampleRate
     private var activeAudioSource: Int = preferredAudioSource
 
+    /**
+     * The audio source the negotiation actually opened, lower-cased for display,
+     * or `null` before [start] has picked one. The caller cannot assume the
+     * preferred source was granted — the rate loop is the outer loop, so a device
+     * that cannot open the preferred rate re-negotiates the source too.
+     */
+    val activeSourceLabel: String?
+        get() = if (recorder != null) audioSourceLabel(activeAudioSource) else null
+
     private val poolLock = Any()
     private val floatBufferPool = ArrayDeque<FloatArray>()
 
@@ -36,11 +47,7 @@ internal class AudioCapture(
         check(recorder == null) { "AudioCapture is already running" }
         resetPool()
 
-        val sources = listOf(
-            preferredAudioSource,
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
-            MediaRecorder.AudioSource.MIC,
-        ).distinct()
+        val sources = audioSourceCandidates(preferredAudioSource)
         val rates = listOf(preferredSampleRate, 44100, 48000).distinct()
 
         var selected: AudioRecord? = null
@@ -94,7 +101,8 @@ internal class AudioCapture(
 
         Log.i(
             "PitchKitAudio",
-            "AudioRecord started source=${sourceName(activeAudioSource)}($activeAudioSource) rate=$activeSampleRate buffer=$bufferSize",
+            "AudioRecord started source=${audioSourceLabel(activeAudioSource)}($activeAudioSource) " +
+                "requested=${audioSourceLabel(preferredAudioSource)} rate=$activeSampleRate buffer=$bufferSize",
         )
 
         job = scope.launch(Dispatchers.IO) {
@@ -125,7 +133,7 @@ internal class AudioCapture(
                     if (consecutiveFailures == 1 || consecutiveFailures % 20 == 0) {
                         Log.w(
                             "PitchKitAudio",
-                            "AudioRecord.read returned $read from ${sourceName(activeAudioSource)} at $activeSampleRate Hz (failure #$consecutiveFailures)",
+                            "AudioRecord.read returned $read from ${audioSourceLabel(activeAudioSource)} at $activeSampleRate Hz (failure #$consecutiveFailures)",
                         )
                     }
                 }
@@ -164,11 +172,47 @@ internal class AudioCapture(
     private fun acquireFloatBuffer(): FloatArray? = synchronized(poolLock) {
         if (floatBufferPool.isEmpty()) null else floatBufferPool.removeFirst()
     }
+}
 
-    private fun sourceName(source: Int): String = when (source) {
-        MediaRecorder.AudioSource.MIC -> "MIC"
-        MediaRecorder.AudioSource.VOICE_RECOGNITION -> "VOICE_RECOGNITION"
-        MediaRecorder.AudioSource.UNPROCESSED -> "UNPROCESSED"
-        else -> "SOURCE"
+/**
+ * Source negotiation order: the caller's preference first, then the two sources
+ * that shipped before `UNPROCESSED` was ever requested.
+ *
+ * Keeping `VOICE_RECOGNITION` and `MIC` in the tail is what makes asking for
+ * `UNPROCESSED` free: a device that cannot open it drops straight back to the
+ * behaviour it had, with no crash path.
+ */
+internal fun audioSourceCandidates(preferredAudioSource: Int): List<Int> = listOf(
+    preferredAudioSource,
+    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+    MediaRecorder.AudioSource.MIC,
+).distinct()
+
+/**
+ * The source the neural chord lanes ask for first.
+ *
+ * `VOICE_RECOGNITION` is a voice-tuned front end — often band-limited and
+ * AGC-shaped — feeding a music model, which the live benchmark plan flags as an
+ * untested design choice. `UNPROCESSED` is the raw alternative, but it is only
+ * meaningful where the device advertises it, so the property is consulted first
+ * and anything unexpected falls back to the shipped source.
+ */
+internal fun preferredNeuralAudioSource(context: Context): Int {
+    val supported = runCatching {
+        val audio = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        audio?.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED)
+    }.getOrNull()
+    return if (supported.equals("true", ignoreCase = true)) {
+        MediaRecorder.AudioSource.UNPROCESSED
+    } else {
+        MediaRecorder.AudioSource.VOICE_RECOGNITION
     }
+}
+
+/** Short display name for a [MediaRecorder.AudioSource], used in logs and the backend string. */
+internal fun audioSourceLabel(source: Int): String = when (source) {
+    MediaRecorder.AudioSource.MIC -> "mic"
+    MediaRecorder.AudioSource.VOICE_RECOGNITION -> "voice-recognition"
+    MediaRecorder.AudioSource.UNPROCESSED -> "unprocessed"
+    else -> "source-$source"
 }
