@@ -36,7 +36,13 @@ class PitchAnalyzer(
         if (frame.samples.isEmpty()) return TuningResult.Silence
         ensureDetectors(frame.sampleRate)
 
-        val buffer = preProcess(frame.toMono(), frame.sampleRate)
+        // YIN ignores DC, and a high-pass restarted on every window leaves a start
+        // transient that pulls low notes by up to 20 cents; note mode skips it.
+        val buffer = preProcess(
+            frame.toMono(),
+            frame.sampleRate,
+            highPass = mode != DetectionMode.NOTE,
+        )
         if (buffer.size < 64) return TuningResult.Silence
 
         var energy = 0.0
@@ -72,7 +78,7 @@ class PitchAnalyzer(
             useFlats = profile.useFlats,
             referenceA4Hz = referenceA4Hz,
         )?.let {
-            TuningResult.Note(it.name, it.cents, it.frequency)
+            TuningResult.Note(it.name, it.cents, it.frequency, it.nameWithOctave)
         } ?: TuningResult.Silence
     }
 
@@ -99,13 +105,13 @@ class PitchAnalyzer(
         yin = YinPitchDetector(
             sampleRate = sampleRate,
             minFrequencyHz = profile.minFreq,
-            maxFrequencyHz = profile.maxFreq,
+            maxFrequencyHz = profile.maxPitchHz.coerceAtMost(profile.maxFreq),
         )
         chordDetector = ChordDetector(sampleRate, profile, referenceA4Hz)
         reset()
     }
 
-    private fun preProcess(raw: FloatArray, sampleRate: Int): FloatArray {
+    private fun preProcess(raw: FloatArray, sampleRate: Int, highPass: Boolean): FloatArray {
         if (raw.isEmpty()) return raw
         if (preProcessScratch.size != raw.size) {
             preProcessScratch = FloatArray(raw.size)
@@ -117,7 +123,7 @@ class PitchAnalyzer(
         for (sample in output) mean += sample
         val meanFloat = (mean / output.size).toFloat()
         for (i in output.indices) output[i] -= meanFloat
-        if (highPassCutoffHz == 0.0) return output
+        if (!highPass || highPassCutoffHz == 0.0) return output
 
         val dt = 1.0 / sampleRate.toDouble()
         val rc = 1.0 / (2.0 * PI * highPassCutoffHz)

@@ -6,6 +6,8 @@ sealed class TuningResult {
         val name: String,
         val cents: Double,
         val freq: Float,
+        /** [name] with its octave, e.g. `"E2"`; shows octave errors and matches open strings. */
+        val nameWithOctave: String = name,
     ) : TuningResult()
 
     /**

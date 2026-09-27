@@ -8,8 +8,12 @@ internal class YinPitchDetector(
     private val minFrequencyHz: Double,
     private val maxFrequencyHz: Double,
     private val threshold: Double = 0.15,
+    // With no dip under [threshold] (noisy rooms), the global minimum is used
+    // instead, as long as it is at least this periodic.
+    private val fallbackThreshold: Double = 0.4,
 ) {
     private var yinScratch = DoubleArray(0)
+    private var differenceScratch = DoubleArray(0)
 
     init {
         require(sampleRate > 0) { "sampleRate must be > 0" }
@@ -46,6 +50,7 @@ internal class YinPitchDetector(
             }
             yinScratch[tau] = sum
         }
+        System.arraycopy(yinScratch, 0, differenceScratch, 0, maxTau + 1)
 
         yinScratch[0] = 1.0
         var runningSum = 0.0
@@ -68,15 +73,25 @@ internal class YinPitchDetector(
             }
             tau++
         }
-        if (estimate == -1) return -1f
+        if (estimate == -1) {
+            var best = minTau
+            for (candidate in minTau + 1..maxTau) {
+                if (yinScratch[candidate] < yinScratch[best]) best = candidate
+            }
+            if (yinScratch[best] > fallbackThreshold) return -1f
+            estimate = best
+        }
 
-        val betterTau = parabolicInterpolation(yinScratch, estimate, maxTau)
+        // Pick the lag on the normalized curve, refine it on the raw difference:
+        // interpolating the normalized curve biases high notes.
+        val betterTau = parabolicInterpolation(differenceScratch, estimate, maxTau)
         return if (betterTau > 0.0) (sampleRate / betterTau).toFloat() else -1f
     }
 
     private fun ensureScratch(requiredSize: Int) {
         if (yinScratch.size < requiredSize) {
             yinScratch = DoubleArray(requiredSize)
+            differenceScratch = DoubleArray(requiredSize)
         }
     }
 
@@ -93,6 +108,6 @@ internal class YinPitchDetector(
         val s1 = yin[tau]
         val s2 = yin[x2]
         val denominator = 2 * (2 * s1 - s2 - s0)
-        return if (denominator == 0.0) tau.toDouble() else tau + (s2 - s0) / denominator
+        return if (denominator == 0.0) tau.toDouble() else tau + ((s2 - s0) / denominator).coerceIn(-1.0, 1.0)
     }
 }

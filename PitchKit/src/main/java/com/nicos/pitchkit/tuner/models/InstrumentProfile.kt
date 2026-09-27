@@ -26,6 +26,9 @@ data class InstrumentProfile(
     val rmsGate: Double = 0.01,
     // Display flats (Bb) instead of sharps (A#). Purely cosmetic.
     val useFlats: Boolean = false,
+    // Highest fundamental (Hz) the note tuner searches for. Separate from
+    // [maxFreq], which is the chroma ceiling and sits far above any fundamental.
+    val maxPitchHz: Double = 1500.0,
 ) {
     /**
      * One open string in the instrument's standard tuning.
