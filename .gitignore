@@ -39,5 +39,17 @@ local.properties
 /PitchKit/src/main/assets/chordformer/*.onnx
 /PitchKit/src/main/assets/chordformer/*.bin
 
-# Private reference-song excerpt used only for local parity checks.
+# ChordFormer has no licence, so nothing derived from it is published here. These are
+# written by tools/accuracy_audit/export_chordformer.py in the Chordwell checkout
+# (tools/restore-chordformer-assets.ps1 there restores the last committed copies).
+/PitchKit/src/main/assets/chordformer/*.json
+/PitchKit/src/test/resources/chordformer-decoder-fixture.json
+
+# Fixtures computed from private reference songs, used only for local parity checks.
+# The published anime fixtures are the animechord-synthetic-* files, made from
+# generated audio by tools/generate-animechord-cqt-plans.py in the Chordwell checkout.
 /PitchKit/src/test/resources/animechord-cqt-audio.s16
+/PitchKit/src/test/resources/animechord-cqt-expected.f32
+/PitchKit/src/test/resources/animechord-cqt-provenance.json
+/PitchKit/src/test/resources/animechord-window.json
+/PitchKit/src/test/resources/animechord-window-*.f32

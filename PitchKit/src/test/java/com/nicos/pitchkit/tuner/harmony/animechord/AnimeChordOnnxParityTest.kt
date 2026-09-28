@@ -11,7 +11,7 @@ import org.junit.Assume.assumeNoException
 import org.junit.Test
 
 /**
- * One real window through the shipped graph, compared against the forward pass the
+ * One window of generated audio through the shipped graph, compared against the forward pass the
  * reference Python runner saved, and the author's own HMM path over the result.
  *
  * The fixture is 648 frames (15.05 s) rather than the shipped 1292, because ONNX Runtime
@@ -21,9 +21,14 @@ import org.junit.Test
  * `AnimeChordWindowPlanTest`.
  */
 class AnimeChordOnnxParityTest {
-    private val provenance = JSONObject(
-        resource("animechord-window.json").toString(Charsets.UTF_8)
-    )
+    private val provenance by lazy {
+        val bytes = javaClass.getResourceAsStream("/$PREFIX.json")?.use { it.readBytes() }
+        org.junit.Assume.assumeTrue(
+            "Run tools/generate-animechord-cqt-plans.py to write the synthetic window fixture",
+            bytes != null,
+        )
+        JSONObject(bytes!!.toString(Charsets.UTF_8))
+    }
 
     @Test
     fun theShippedGraphReproducesTheReferenceForwardPass() {
@@ -35,11 +40,11 @@ class AnimeChordOnnxParityTest {
         val frames = provenance.getInt("frames")
         assertEquals(AnimeChordContract.ROOT_CHORD_COUNT, provenance.getInt("root_classes"))
 
-        val spec = floats(resource("animechord-window-spec.f32"))
+        val spec = floats(resource("$PREFIX-spec.f32"))
         assertEquals(frames * AnimeChordContract.INPUT_BINS, spec.size)
-        val expectedRoot = floats(resource("animechord-window-root.f32"))
+        val expectedRoot = floats(resource("$PREFIX-root.f32"))
         assertEquals(frames * AnimeChordContract.ROOT_CHORD_COUNT, expectedRoot.size)
-        val expectedOthers = floats(resource("animechord-window-heads.f32"))
+        val expectedOthers = floats(resource("$PREFIX-heads.f32"))
         val otherWidth = AnimeChordContract.BASS_COUNT + AnimeChordContract.KEY_COUNT + 3
         assertEquals(frames * otherWidth, expectedOthers.size)
 
@@ -106,7 +111,7 @@ class AnimeChordOnnxParityTest {
     @Test
     fun theStickyViterbiWalksTheSamePathTheReferenceDid() {
         val frames = provenance.getInt("frames")
-        val logits = floats(resource("animechord-window-root.f32"))
+        val logits = floats(resource("$PREFIX-root.f32"))
         val expected = intArray(provenance.getJSONArray("root_path"))
         assertEquals(frames, expected.size)
 
@@ -120,7 +125,7 @@ class AnimeChordOnnxParityTest {
         assertArrayEqualsWithReport("root", expected, viterbi.decode())
 
         val bassLogits = column(
-            floats(resource("animechord-window-heads.f32")),
+            floats(resource("$PREFIX-heads.f32")),
             frames,
             AnimeChordContract.BASS_COUNT + AnimeChordContract.KEY_COUNT + 3,
             0,
@@ -187,5 +192,11 @@ class AnimeChordOnnxParityTest {
     private fun floats(bytes: ByteArray): FloatArray {
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         return FloatArray(buffer.remaining()).also { buffer.get(it) }
+    }
+
+    private companion object {
+        // One window of generated audio, never a recording: see
+        // tools/generate-animechord-cqt-plans.py.
+        const val PREFIX = "animechord-synthetic-window"
     }
 }

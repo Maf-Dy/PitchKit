@@ -163,6 +163,10 @@ internal object ChordFormerTestAssets {
             if (nested.isFile) return nested
             directory = directory.parentFile
         }
-        throw AssertionError("Could not locate ChordFormer asset $name")
+        // ChordFormer has no licence, so its exported files are never committed; they
+        // exist only where tools/accuracy_audit/export_chordformer.py has been run.
+        throw org.junit.AssumptionViolatedException(
+            "ChordFormer asset $name is not in this checkout (personal research files)"
+        )
     }
 }

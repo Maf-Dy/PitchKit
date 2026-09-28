@@ -1,0 +1,37 @@
+PitchKit (modern-pitch-tuner fork)
+
+This is a maintained fork of PitchKit by Nicos Nicolaou
+(https://github.com/NicosNicolaou16/PitchKit), licensed under the Apache License,
+Version 2.0. The fork's changes are licensed under the same terms. See LICENSE and
+UPSTREAM.md.
+
+Model weights
+-------------
+No neural model weights are included in this repository. The chord engines load
+weights that each user downloads or exports locally from the original authors'
+releases, under those authors' licences:
+
+- Crema (https://github.com/bmcfee/crema), BSD-2-Clause; ONNX conversion from
+  TuneForge (https://github.com/grazzolini/tuneforge), MIT.
+- LV Song / lv-chordia (https://github.com/openmirlab/lv-chordia), MIT.
+- Consonance (https://github.com/andreamust/consonance-ACE), MIT.
+- solitito-ai (https://github.com/greblus/solitito-ai), MIT.
+- ChordMini ChordNet and BTC (https://github.com/ptnghia-j/ChordMini): code MIT, but
+  the training data includes non-commercial material. Personal use only.
+- anime-song Chord-Transcription (https://github.com/anime-song/Chord-Transcription):
+  the weights are marked MIT on the model card, but the code has no licence. Personal
+  use only until the author confirms.
+- ChordFormer (https://github.com/mwaseemrandhawa/ChordFormer): no licence. Its
+  exported files are never committed here. Personal research use only.
+
+GuitarSet (CC BY 4.0)
+---------------------
+PitchKit/src/test/resources/solitito-parity-audio.s16 is a three-second excerpt of one
+GuitarSet recording, stored as raw 16-bit PCM for use as a regression fixture. No
+other change was made.
+
+GuitarSet: Qingyang Xi, Rachel M. Bittner, Johan Pauwels, Xuzhou Ye and Juan Pablo
+Bello, "GuitarSet: A Dataset for Guitar Transcription", ISMIR 2018.
+https://guitarset.weebly.com/ - https://zenodo.org/record/3371780
+Licence: Creative Commons Attribution 4.0 International,
+https://creativecommons.org/licenses/by/4.0/

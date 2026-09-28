@@ -22,8 +22,13 @@ import org.junit.Test
 class ChordFormerDecoderParityTest {
     @Test
     fun matchesThePythonXhmmFrameByFrame() {
+        val stream = javaClass.getResourceAsStream("/chordformer-decoder-fixture.json")
+        org.junit.Assume.assumeTrue(
+            "The ChordFormer decoder fixture is written locally by export_chordformer.py",
+            stream != null,
+        )
         val fixture = JSONObject(
-            requireNotNull(javaClass.getResourceAsStream("/chordformer-decoder-fixture.json"))
+            stream!!
                 .use { it.readBytes() }
                 .toString(Charsets.UTF_8)
         )
